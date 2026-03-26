@@ -1,262 +1,260 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// MATCHEDCARE — Stripe Webhook & Referral Billing Server
-// Deploy to: Railway, Render, Fly.io, or any Node.js host
-// ═══════════════════════════════════════════════════════════════════════════════
-
-const express = require("express");
-const Stripe = require("stripe");
-const { createClient } = require("@supabase/supabase-js");
-
-// ── Config ──────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3001;
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-const stripe = new Stripe(STRIPE_SECRET_KEY);
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-
-// ── Price IDs ───────────────────────────────────────────────────────────────
-const PRICES = {
-  provider_founder:   "price_1TD5voQ9vFrlUZBqpkQQZEB8",  // $89.99/mo
-  provider_standard:  "price_1TD60VQ9vFrlUZBqmeZY4tvw",  // $119.99/mo
-  clinic_founder:     "price_1TD62SQ9vFrlUZBqlpzcEOlT",  // $375/mo
-  clinic_standard:    "price_1TD64kQ9vFrlUZBqs49ylM8J",  // $500/mo
-  clinic_addon_founder:  "price_1TD640Q9vFrlUZBqTkoFRRQO", // $37.50/mo
-  clinic_addon_standard: "price_1TD668Q9vFrlUZBqcaPP7lTK", // $50/mo
-};
+const express = require('express');
+const cors = require('cors');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+const PORT = process.env.PORT || 3001;
 
-// ── Webhook endpoint (raw body needed for signature verification) ────────────
-app.post("/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+// Supabase client with service role key (server-side only)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// CORS — allow your frontend domain
+app.use(cors({
+  origin: ['https://matchedcare.us', 'https://www.matchedcare.us', 'http://localhost:5173', 'http://localhost:3000'],
+  methods: ['GET', 'POST'],
+  credentials: true
+}));
+
+// Stripe webhook needs raw body
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
   let event;
+
   try {
-    event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], STRIPE_WEBHOOK_SECRET);
+    event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error("Webhook signature failed:", err.message);
+    console.error('Webhook signature verification failed:', err.message);
     return res.status(400).send(`Webhook Error: ${err.message}`);
   }
 
-  console.log(`Stripe event: ${event.type}`);
+  console.log('Webhook received:', event.type);
 
   switch (event.type) {
-    case "customer.subscription.created":
-    case "customer.subscription.updated": {
-      const sub = event.data.object;
-      // Find provider by stripe_customer_id
-      const { data } = await supabase
-        .from("subscriptions")
-        .select("therapist_id")
-        .eq("stripe_customer_id", sub.customer)
-        .single();
-      if (data) {
-        await supabase.rpc("update_stripe_subscription", {
-          p_provider_id: data.therapist_id,
-          p_customer_id: sub.customer,
-          p_subscription_id: sub.id,
-          p_status: sub.status === "active" ? "active" : sub.status === "trialing" ? "trialing" : sub.status,
-        });
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      console.log('Checkout session completed:', session.id);
+
+      // If this was a setup mode session, save the customer ID and payment method
+      if (session.mode === 'setup' && session.metadata?.user_id) {
+        try {
+          await supabase
+            .from('subscriptions')
+            .update({
+              stripe_customer_id: session.customer,
+              status: 'trialing',
+              updated_at: new Date().toISOString()
+            })
+            .eq('therapist_id', session.metadata.user_id);
+
+          console.log('Updated subscription for user:', session.metadata.user_id);
+        } catch (err) {
+          console.error('Error updating subscription:', err.message);
+        }
       }
       break;
     }
 
-    case "customer.subscription.deleted": {
-      const sub = event.data.object;
-      const { data } = await supabase
-        .from("subscriptions")
-        .select("therapist_id")
-        .eq("stripe_customer_id", sub.customer)
-        .single();
-      if (data) {
-        await supabase.rpc("update_stripe_subscription", {
-          p_provider_id: data.therapist_id,
-          p_customer_id: sub.customer,
-          p_subscription_id: sub.id,
-          p_status: "canceled",
-        });
+    case 'customer.subscription.created': {
+      const subscription = event.data.object;
+      console.log('Subscription created:', subscription.id);
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      const subscription = event.data.object;
+      console.log('Subscription updated:', subscription.id, 'Status:', subscription.status);
+
+      // Find the customer's user and update status
+      try {
+        const { data } = await supabase
+          .from('subscriptions')
+          .select('therapist_id')
+          .eq('stripe_customer_id', subscription.customer)
+          .single();
+
+        if (data) {
+          await supabase
+            .from('subscriptions')
+            .update({
+              stripe_subscription_id: subscription.id,
+              status: subscription.status === 'active' ? 'active' : subscription.status,
+              updated_at: new Date().toISOString()
+            })
+            .eq('therapist_id', data.therapist_id);
+        }
+      } catch (err) {
+        console.error('Error handling subscription update:', err.message);
       }
       break;
     }
 
-    case "invoice.payment_failed": {
-      const invoice = event.data.object;
-      console.warn(`Payment failed for customer ${invoice.customer}`);
-      // Update status to past_due
-      const { data } = await supabase
-        .from("subscriptions")
-        .select("therapist_id")
-        .eq("stripe_customer_id", invoice.customer)
-        .single();
-      if (data) {
+    case 'customer.subscription.deleted': {
+      const subscription = event.data.object;
+      console.log('Subscription cancelled:', subscription.id);
+
+      try {
         await supabase
-          .from("subscriptions")
-          .update({ status: "past_due" })
-          .eq("therapist_id", data.therapist_id);
+          .from('subscriptions')
+          .update({
+            status: 'cancelled',
+            updated_at: new Date().toISOString()
+          })
+          .eq('stripe_subscription_id', subscription.id);
+      } catch (err) {
+        console.error('Error handling subscription deletion:', err.message);
       }
       break;
     }
 
     default:
-      console.log(`Unhandled event: ${event.type}`);
+      console.log('Unhandled event type:', event.type);
   }
 
   res.json({ received: true });
 });
 
-// ── JSON body for all other routes ──────────────────────────────────────────
+// JSON body parser for all other routes
 app.use(express.json());
 
-// ── Start billing after 4th referral ────────────────────────────────────────
-// Called by Supabase Edge Function or your matching system
-app.post("/start-billing", async (req, res) => {
-  try {
-    const { provider_id, provider_type, email, name } = req.body;
-    // provider_type: "provider" or "clinic"
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', service: 'matchedcare-billing' });
+});
 
-    if (!provider_id || !email) {
-      return res.status(400).json({ error: "provider_id and email required" });
+// ═══════════════════════════════════════════════════════════════════════════
+// CREATE SETUP INTENT — Collects payment method without charging
+// Uses Stripe Checkout in setup mode for hosted, secure card collection
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/create-setup-intent', async (req, res) => {
+  try {
+    const { email, user_id, plan_type } = req.body;
+
+    if (!email || !user_id) {
+      return res.status(400).json({ error: 'Email and user_id are required' });
     }
 
-    const isClinic = provider_type === "clinic";
-    const founderPrice = isClinic ? PRICES.clinic_founder : PRICES.provider_founder;
-    const standardPrice = isClinic ? PRICES.clinic_standard : PRICES.provider_standard;
-
-    // 1. Create or retrieve Stripe customer
+    // Check if customer already exists
     let customer;
-    const { data: sub } = await supabase
-      .from("subscriptions")
-      .select("stripe_customer_id")
-      .eq("therapist_id", provider_id)
-      .single();
+    const existing = await stripe.customers.list({ email, limit: 1 });
 
-    if (sub?.stripe_customer_id) {
-      customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+    if (existing.data.length > 0) {
+      customer = existing.data[0];
     } else {
       customer = await stripe.customers.create({
         email,
-        name: name || email,
-        metadata: { provider_id, provider_type },
+        metadata: { user_id, plan_type: plan_type || 'provider_founder' }
       });
-      // Save customer ID to Supabase
-      await supabase
-        .from("subscriptions")
-        .update({ stripe_customer_id: customer.id })
-        .eq("therapist_id", provider_id);
     }
 
-    // 2. Create a Subscription Schedule:
-    //    Phase 1: Founder pricing for 3 months
-    //    Phase 2: Standard pricing ongoing
-    const now = Math.floor(Date.now() / 1000);
-    const threeMonthsLater = now + (90 * 24 * 60 * 60); // 90 days
+    // Update Supabase with Stripe customer ID
+    await supabase
+      .from('subscriptions')
+      .update({
+        stripe_customer_id: customer.id,
+        updated_at: new Date().toISOString()
+      })
+      .eq('therapist_id', user_id);
 
-    const schedule = await stripe.subscriptionSchedules.create({
+    // Create Stripe Checkout Session in setup mode
+    const session = await stripe.checkout.sessions.create({
+      mode: 'setup',
       customer: customer.id,
-      start_date: "now",
-      end_behavior: "release", // continues as regular subscription after schedule ends
+      payment_method_types: ['card'],
+      success_url: `${req.headers.origin || 'https://matchedcare.us'}?setup=success`,
+      cancel_url: `${req.headers.origin || 'https://matchedcare.us'}?setup=cancelled`,
+      metadata: { user_id, plan_type: plan_type || 'provider_founder' }
+    });
+
+    console.log('Setup session created:', session.id, 'for user:', user_id);
+    res.json({ url: session.url, session_id: session.id });
+
+  } catch (err) {
+    console.error('Error creating setup intent:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// START BILLING — Called after 5th referral to create subscription
+// Creates a Subscription Schedule: Founder price for 3 months → Standard
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/start-billing', async (req, res) => {
+  try {
+    const { stripe_customer_id, plan_type } = req.body;
+
+    if (!stripe_customer_id) {
+      return res.status(400).json({ error: 'stripe_customer_id is required' });
+    }
+
+    // Price IDs from your Stripe account
+    const prices = {
+      provider_founder: 'price_1TD5voQ9vFrlUZBqpkQQZEB8',     // $89.99/mo
+      provider_standard: 'price_1TD60VQ9vFrlUZBqmeZY4tvw',     // $119.99/mo
+      clinic_founder: 'price_1TD62SQ9vFrlUZBqlpzcEOlT',        // $375/mo
+      clinic_standard: 'price_1TD64kQ9vFrlUZBqs49ylM8J',       // $500/mo
+    };
+
+    const founderPrice = plan_type === 'clinic' ? prices.clinic_founder : prices.provider_founder;
+    const standardPrice = plan_type === 'clinic' ? prices.clinic_standard : prices.provider_standard;
+
+    // Create subscription schedule: 3 months founder → standard
+    const schedule = await stripe.subscriptionSchedules.create({
+      customer: stripe_customer_id,
+      start_date: 'now',
+      end_behavior: 'release',
       phases: [
         {
-          items: [{ price: founderPrice, quantity: 1 }],
-          end_date: threeMonthsLater,
-          metadata: { phase: "founder", provider_id },
+          items: [{ price: founderPrice }],
+          iterations: 3, // 3 months at founder price
         },
         {
-          items: [{ price: standardPrice, quantity: 1 }],
-          metadata: { phase: "standard", provider_id },
-        },
-      ],
+          items: [{ price: standardPrice }],
+          // No end — continues at standard price
+        }
+      ]
     });
 
-    // 3. Update Supabase with schedule info
-    await supabase.rpc("update_stripe_subscription", {
-      p_provider_id: provider_id,
-      p_customer_id: customer.id,
-      p_subscription_id: schedule.subscription,
-      p_schedule_id: schedule.id,
-      p_status: "active",
-    });
-
-    console.log(`Billing started for ${provider_id}: Founder → Standard in 90 days`);
-
+    console.log('Subscription schedule created:', schedule.id);
     res.json({
-      success: true,
-      customer_id: customer.id,
       schedule_id: schedule.id,
       subscription_id: schedule.subscription,
-      founder_price: founderPrice,
-      standard_price: standardPrice,
-      transition_date: new Date(threeMonthsLater * 1000).toISOString(),
+      status: 'active'
     });
 
   } catch (err) {
-    console.error("Start billing error:", err);
+    console.error('Error starting billing:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── Collect payment method during signup (before billing starts) ─────────────
-// Creates a SetupIntent so we have their card on file for when billing begins
-app.post("/create-setup-intent", async (req, res) => {
-  try {
-    const { provider_id, email, name } = req.body;
-
-    // Create Stripe customer
-    const customer = await stripe.customers.create({
-      email,
-      name: name || email,
-      metadata: { provider_id },
-    });
-
-    // Save customer ID
-    await supabase
-      .from("subscriptions")
-      .update({ stripe_customer_id: customer.id })
-      .eq("therapist_id", provider_id);
-
-    // Create SetupIntent (collects card without charging)
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customer.id,
-      payment_method_types: ["card"],
-      metadata: { provider_id },
-    });
-
-    res.json({
-      client_secret: setupIntent.client_secret,
-      customer_id: customer.id,
-    });
-
-  } catch (err) {
-    console.error("Setup intent error:", err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── Customer portal (manage billing) ────────────────────────────────────────
-app.post("/create-portal-session", async (req, res) => {
+// ═══════════════════════════════════════════════════════════════════════════
+// CREATE PORTAL SESSION — Let providers manage their subscription
+// ═══════════════════════════════════════════════════════════════════════════
+app.post('/create-portal-session', async (req, res) => {
   try {
     const { stripe_customer_id, return_url } = req.body;
+
+    if (!stripe_customer_id) {
+      return res.status(400).json({ error: 'stripe_customer_id is required' });
+    }
+
     const session = await stripe.billingPortal.sessions.create({
       customer: stripe_customer_id,
-      return_url: return_url || "https://matchedcare.us",
+      return_url: return_url || 'https://matchedcare.us'
     });
+
     res.json({ url: session.url });
+
   } catch (err) {
-    console.error("Portal session error:", err);
+    console.error('Error creating portal session:', err.message);
     res.status(500).json({ error: err.message });
   }
-});
-
-// ── Health check ────────────────────────────────────────────────────────────
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", service: "matchedcare-billing", timestamp: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
-  console.log(`Webhook: POST /webhook`);
-  console.log(`Start billing: POST /start-billing`);
-  console.log(`Setup intent: POST /create-setup-intent`);
-  console.log(`Customer portal: POST /create-portal-session`);
 });
