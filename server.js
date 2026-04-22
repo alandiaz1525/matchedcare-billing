@@ -331,14 +331,45 @@ app.post('/create-setup-intent', async (req, res) => {
   }
 });
 
+// Clinic base plan includes the first 5 providers; the addon price bills each provider beyond 5.
+const PRICES = {
+  provider_founder: 'price_1TP9VOPtdczvTubYBbx3FaOR',
+  provider_standard: 'price_1TP9VOPtdczvTubYD0iO68q8',
+  clinic_founder_base: 'price_1TP9VPPtdczvTubYSorA5S9j',
+  clinic_founder_addon: 'price_1TP9VQPtdczvTubYWj6HlaH5',
+  clinic_standard_base: 'price_1TP9VRPtdczvTubYkTZhH07J',
+  clinic_standard_addon: 'price_1TP9VSPtdczvTubYDTujrcPQ',
+};
+const CLINIC_BASE_PROVIDERS_INCLUDED = 5;
+
 app.post('/start-billing', async (req, res) => {
   try {
-    const { stripe_customer_id, plan_type } = req.body;
+    const { stripe_customer_id, plan_type, provider_count } = req.body;
     if (!stripe_customer_id) return res.status(400).json({ error: 'stripe_customer_id is required' });
-    const prices = { provider_founder: 'price_1TD5voQ9vFrlUZBqpkQQZEB8', provider_standard: 'price_1TD60VQ9vFrlUZBqmeZY4tvw', clinic_founder: 'price_1TD62SQ9vFrlUZBqlpzcEOlT', clinic_standard: 'price_1TD64kQ9vFrlUZBqs49ylM8J' };
-    const founderPrice = plan_type === 'clinic' ? prices.clinic_founder : prices.provider_founder;
-    const standardPrice = plan_type === 'clinic' ? prices.clinic_standard : prices.provider_standard;
-    const schedule = await stripe.subscriptionSchedules.create({ customer: stripe_customer_id, start_date: 'now', end_behavior: 'release', phases: [{ items: [{ price: founderPrice }], iterations: 3 }, { items: [{ price: standardPrice }] }] });
+
+    let founderItems, standardItems;
+    if (plan_type === 'clinic') {
+      const addonQty = Math.max(0, (Number(provider_count) || 0) - CLINIC_BASE_PROVIDERS_INCLUDED);
+      founderItems = [{ price: PRICES.clinic_founder_base }];
+      standardItems = [{ price: PRICES.clinic_standard_base }];
+      if (addonQty > 0) {
+        founderItems.push({ price: PRICES.clinic_founder_addon, quantity: addonQty });
+        standardItems.push({ price: PRICES.clinic_standard_addon, quantity: addonQty });
+      }
+    } else {
+      founderItems = [{ price: PRICES.provider_founder }];
+      standardItems = [{ price: PRICES.provider_standard }];
+    }
+
+    const schedule = await stripe.subscriptionSchedules.create({
+      customer: stripe_customer_id,
+      start_date: 'now',
+      end_behavior: 'release',
+      phases: [
+        { items: founderItems, iterations: 3 },
+        { items: standardItems },
+      ],
+    });
     res.json({ schedule_id: schedule.id, subscription_id: schedule.subscription, status: 'active' });
   } catch (err) {
     res.status(500).json({ error: err.message });
