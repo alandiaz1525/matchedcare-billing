@@ -11,6 +11,67 @@ const PORT = process.env.PORT || 3001;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM_EMAIL = process.env.FROM_EMAIL || 'MatchedCare <notifications@matchedcare.us>';
+const ALLOWED_RETURN_ORIGINS = new Set([
+  'https://matchedcare.us',
+  'https://www.matchedcare.us',
+  'http://localhost:5173',
+  'http://localhost:3000',
+]);
+
+function getBearerToken(req) {
+  const header = req.headers.authorization || '';
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  return match ? match[1] : null;
+}
+
+async function requireUser(req, res, next) {
+  const token = getBearerToken(req);
+  if (!token) return res.status(401).json({ error: 'Authentication required' });
+
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return res.status(401).json({ error: 'Invalid authentication token' });
+
+  req.authUser = data.user;
+  next();
+}
+
+async function requireAdmin(req, res, next) {
+  await requireUser(req, res, async () => {
+    const metadataRole = req.authUser.app_metadata?.role || req.authUser.user_metadata?.role;
+    if (metadataRole === 'admin') return next();
+
+    const { data } = await supabase
+      .from('profiles')
+      .select('role')
+      .eq('user_id', req.authUser.id)
+      .single();
+
+    if (data?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    next();
+  });
+}
+
+function allowedReturnUrl(value, fallback = 'https://matchedcare.us') {
+  try {
+    const url = new URL(value || fallback);
+    if (ALLOWED_RETURN_ORIGINS.has(url.origin)) return url.toString();
+  } catch {}
+  return fallback;
+}
+
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeEmail(value) {
+  const email = String(value || '').trim();
+  return /^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']+$/.test(email) ? email : '';
+}
 
 // Twilio SMS client (only init if credentials exist)
 let twilioClient = null;
@@ -82,6 +143,31 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       }
       break;
     }
+    case 'setup_intent.succeeded': {
+      const si = event.data.object;
+      const userId = si.metadata?.user_id;
+      if (userId) {
+        if (si.payment_method && si.customer) {
+          try {
+            await stripe.customers.update(si.customer, {
+              invoice_settings: { default_payment_method: si.payment_method },
+            });
+          } catch (e) {
+            console.warn('default PM update failed:', e.message);
+          }
+        }
+        await supabase
+          .from('subscriptions')
+          .update({
+            payment_method_pending: false,
+            stripe_customer_id: si.customer,
+            status: 'trialing',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('therapist_id', userId);
+      }
+      break;
+    }
     case 'customer.subscription.created':
     case 'customer.subscription.updated': {
       const sub = event.data.object;
@@ -132,55 +218,58 @@ h1{font-size:22px;font-weight:500;color:#1A242E;margin:0 0 8px;line-height:1.3}
 }
 
 function clientMatchEmail({ clientName, providerName, providerCredentials, providerType, matchScore, providerEmail, explanation }) {
+  const email = safeEmail(providerEmail);
   return emailWrapper(`
     <h1>You've been matched!</h1>
-    <p class="subtitle">Great news, ${clientName}. We've found a provider who fits what you're looking for.</p>
-    <div class="info-box"><p class="info-label">Your Match</p><p class="info-value">${providerName}</p>
-    ${providerCredentials ? `<p style="font-size:13px;color:#6E7178;margin:4px 0 0">${providerCredentials} · ${providerType || 'Provider'}</p>` : ''}
+    <p class="subtitle">Great news, ${escapeHtml(clientName)}. We've found a provider who fits what you're looking for.</p>
+    <div class="info-box"><p class="info-label">Your Match</p><p class="info-value">${escapeHtml(providerName)}</p>
+    ${providerCredentials ? `<p style="font-size:13px;color:#6E7178;margin:4px 0 0">${escapeHtml(providerCredentials)} - ${escapeHtml(providerType || 'Provider')}</p>` : ''}
     ${matchScore ? `<p style="margin:8px 0 0"><span class="score">${Math.round(matchScore)}% compatibility</span></p>` : ''}</div>
-    ${explanation ? `<div class="highlight"><p>${explanation}</p></div>` : ''}
-    <div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${providerEmail}" style="color:#4A7C9B;text-decoration:none">${providerEmail}</a></p></div>
+    ${explanation ? `<div class="highlight"><p>${escapeHtml(explanation)}</p></div>` : ''}
+    ${email ? `<div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
     <p style="font-size:14px;color:#6E7178;line-height:1.6">Your provider has been notified and is ready to connect.</p>
-    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Go to Dashboard →</a></div>`);
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Go to Dashboard</a></div>`);
 }
 
 function providerMatchEmail({ providerName, clientName, clientEmail, matchScore, concerns, explanation, referralCount }) {
+  const email = safeEmail(clientEmail);
   return emailWrapper(`
     <h1>New client referral</h1>
-    <p class="subtitle">${providerName}, you have a new matched client.</p>
-    <div class="info-box"><p class="info-label">Client</p><p class="info-value">${clientName}</p>
+    <p class="subtitle">${escapeHtml(providerName)}, you have a new matched client.</p>
+    <div class="info-box"><p class="info-label">Client</p><p class="info-value">${escapeHtml(clientName)}</p>
     ${matchScore ? `<p style="margin:8px 0 0"><span class="score">${Math.round(matchScore)}% compatibility</span></p>` : ''}</div>
-    ${concerns && concerns.length > 0 ? `<div class="info-box"><p class="info-label">Primary Concerns</p><p style="font-size:14px;color:#2C3038;margin:4px 0 0">${concerns.join(', ')}</p></div>` : ''}
-    ${explanation ? `<div class="highlight"><p><strong>Why you were matched:</strong> ${explanation}</p></div>` : ''}
-    <div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${clientEmail}" style="color:#4A7C9B;text-decoration:none">${clientEmail}</a></p></div>
-    ${referralCount !== undefined ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">This is referral #${referralCount}${referralCount < 5 ? ' of your 5 free referrals.' : '. Billing is now active.'}</p>` : ''}
-    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard →</a></div>`);
+    ${concerns && concerns.length > 0 ? `<div class="info-box"><p class="info-label">Primary Concerns</p><p style="font-size:14px;color:#2C3038;margin:4px 0 0">${escapeHtml(concerns.join(', '))}</p></div>` : ''}
+    ${explanation ? `<div class="highlight"><p><strong>Why you were matched:</strong> ${escapeHtml(explanation)}</p></div>` : ''}
+    ${email ? `<div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
+    ${referralCount !== undefined ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">This is referral #${escapeHtml(referralCount)}${referralCount < 5 ? ' of your 5 free referrals.' : '. Billing is now active.'}</p>` : ''}
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard</a></div>`);
 }
 
 function clinicMatchEmail({ clinicName, clientName, clientEmail, serviceType, matchScore, explanation, ageGroup }) {
   const serviceLabels = { aba: 'ABA Services', speech: 'Speech Therapy', occupational_therapy: 'Occupational Therapy' };
+  const email = safeEmail(clientEmail);
   return emailWrapper(`
     <h1>New client matched to your clinic</h1>
-    <p class="subtitle">${clinicName}, a new client has been matched to your practice.</p>
-    <div class="info-box"><p class="info-label">Client</p><p class="info-value">${clientName}</p>
-    <p style="font-size:13px;color:#6E7178;margin:4px 0 0">Service: ${serviceLabels[serviceType] || serviceType}${ageGroup ? ' · Age group: ' + ageGroup : ''}</p>
+    <p class="subtitle">${escapeHtml(clinicName)}, a new client has been matched to your practice.</p>
+    <div class="info-box"><p class="info-label">Client</p><p class="info-value">${escapeHtml(clientName)}</p>
+    <p style="font-size:13px;color:#6E7178;margin:4px 0 0">Service: ${escapeHtml(serviceLabels[serviceType] || serviceType)}${ageGroup ? ' - Age group: ' + escapeHtml(ageGroup) : ''}</p>
     ${matchScore ? `<p style="margin:8px 0 0"><span class="score">${Math.round(matchScore)}% compatibility</span></p>` : ''}</div>
-    ${explanation ? `<div class="highlight"><p>${explanation}</p></div>` : ''}
-    <div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${clientEmail}" style="color:#4A7C9B;text-decoration:none">${clientEmail}</a></p></div>
+    ${explanation ? `<div class="highlight"><p>${escapeHtml(explanation)}</p></div>` : ''}
+    ${email ? `<div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
     <p style="font-size:14px;color:#6E7178;line-height:1.6">Please assign this client to an available provider and reach out to schedule.</p>
-    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard →</a></div>`);
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard</a></div>`);
 }
 
 function welcomeEmail({ name, role }) {
   const msgs = { client: "We're here to help you find a provider who truly fits.", therapist: "Complete your profile and you'll start receiving matched client referrals. Your first 5 referrals are free.", clinic: "Once activated, you'll start receiving matched client referrals automatically." };
-  return emailWrapper(`<h1>Welcome to MatchedCare</h1><p class="subtitle">${name}, your account has been created.</p><p style="font-size:14px;color:#6E7178;line-height:1.7">${msgs[role] || msgs.client}</p><div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Get Started →</a></div>`);
+  return emailWrapper(`<h1>Welcome to MatchedCare</h1><p class="subtitle">${escapeHtml(name)}, your account has been created.</p><p style="font-size:14px;color:#6E7178;line-height:1.7">${escapeHtml(msgs[role] || msgs.client)}</p><div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Get Started</a></div>`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTIFICATION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.post('/notify-match', async (req, res) => {
+app.post('/notify-match', requireUser, async (req, res) => {
   try {
     const { match_id, match_type } = req.body;
     if (!match_id) return res.status(400).json({ error: 'match_id is required' });
@@ -190,6 +279,7 @@ app.post('/notify-match', async (req, res) => {
     if (match_type === 'clinic') {
       const { data: match } = await supabase.from('clinic_matches').select('*').eq('id', match_id).single();
       if (!match) return res.status(404).json({ error: 'Clinic match not found' });
+      if (req.authUser.id !== match.client_id) return res.status(403).json({ error: 'Forbidden' });
 
       const { data: clientProfile } = await supabase.from('profiles').select('full_name, email, phone').eq('user_id', match.client_id).single();
       const { data: clinic } = await supabase.from('clinics').select('clinic_name, email, owner_id, phone').eq('id', match.clinic_id).single();
@@ -225,6 +315,7 @@ app.post('/notify-match', async (req, res) => {
     } else {
       const { data: match } = await supabase.from('matches').select('*').eq('id', match_id).single();
       if (!match) return res.status(404).json({ error: 'Match not found' });
+      if (req.authUser.id !== match.client_id && req.authUser.id !== match.therapist_id) return res.status(403).json({ error: 'Forbidden' });
 
       const { data: clientProfile } = await supabase.from('profiles').select('full_name, email, phone').eq('user_id', match.client_id).single();
       const { data: providerProfile } = await supabase.from('profiles').select('full_name, email, phone').eq('user_id', match.therapist_id).single();
@@ -265,10 +356,11 @@ app.post('/notify-match', async (req, res) => {
   }
 });
 
-app.post('/send-welcome', async (req, res) => {
+app.post('/send-welcome', requireUser, async (req, res) => {
   try {
-    const { email, name, role, phone, smsOptIn } = req.body;
-    if (!email) return res.status(400).json({ error: 'email is required' });
+    const { name, role, phone, smsOptIn } = req.body;
+    const email = req.authUser.email;
+    if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
     await resend.emails.send({ from: FROM_EMAIL, to: email, subject: 'Welcome to MatchedCare', html: welcomeEmail({ name: name || 'there', role: role || 'client' }) });
     // Send welcome SMS if opted in
     if (smsOptIn && phone) {
@@ -280,7 +372,7 @@ app.post('/send-welcome', async (req, res) => {
   }
 });
 
-app.post('/send-sms', async (req, res) => {
+app.post('/send-sms', requireAdmin, async (req, res) => {
   try {
     const { to, message } = req.body;
     if (!to || !message) return res.status(400).json({ error: 'to and message are required' });
@@ -291,7 +383,7 @@ app.post('/send-sms', async (req, res) => {
   }
 });
 
-app.post('/test-email', async (req, res) => {
+app.post('/test-email', requireAdmin, async (req, res) => {
   try {
     const testTo = req.body.to || 'alandiaz.wb@gmail.com';
     await resend.emails.send({ from: FROM_EMAIL, to: testTo, subject: 'MatchedCare — Test Email', html: emailWrapper(`<h1>Email is working!</h1><p class="subtitle">Your Resend integration is configured correctly.</p>`) });
@@ -301,7 +393,7 @@ app.post('/test-email', async (req, res) => {
   }
 });
 
-app.post('/test-sms', async (req, res) => {
+app.post('/test-sms', requireAdmin, async (req, res) => {
   try {
     const testTo = req.body.to;
     if (!testTo) return res.status(400).json({ error: 'to phone number is required' });
@@ -316,17 +408,97 @@ app.post('/test-sms', async (req, res) => {
 // STRIPE ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.post('/create-setup-intent', async (req, res) => {
+app.post('/create-setup-intent', requireUser, async (req, res) => {
   try {
-    const { email, user_id, plan_type } = req.body;
-    if (!email || !user_id) return res.status(400).json({ error: 'Email and user_id are required' });
+    const { plan_type } = req.body;
+    const user_id = req.authUser.id;
+    const email = req.authUser.email;
+    if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
+
+    // 1. Find or create the Stripe Customer for this user.
     let customer;
     const existing = await stripe.customers.list({ email, limit: 1 });
-    customer = existing.data.length > 0 ? existing.data[0] : await stripe.customers.create({ email, metadata: { user_id, plan_type: plan_type || 'provider_founder' } });
-    await supabase.from('subscriptions').update({ stripe_customer_id: customer.id, updated_at: new Date().toISOString() }).eq('therapist_id', user_id);
-    const session = await stripe.checkout.sessions.create({ mode: 'setup', customer: customer.id, payment_method_types: ['card'], success_url: `${req.headers.origin || 'https://matchedcare.us'}?setup=success`, cancel_url: `${req.headers.origin || 'https://matchedcare.us'}?setup=cancelled`, metadata: { user_id, plan_type: plan_type || 'provider_founder' } });
-    res.json({ url: session.url, session_id: session.id });
+    if (existing.data.length > 0) {
+      customer = existing.data[0];
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        metadata: { user_id, plan_type: plan_type || 'provider_founder' },
+      });
+    }
+
+    // 2. UPSERT the subscriptions row so we never silently drop the customer
+    //    id when the row hasn't been created yet (e.g. a brand-new signup).
+    await supabase
+      .from('subscriptions')
+      .upsert(
+        {
+          therapist_id: user_id,
+          stripe_customer_id: customer.id,
+          plan_type: plan_type || 'provider_founder',
+          status: 'pending',
+          payment_method_pending: true,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'therapist_id' }
+      );
+
+    // 3. Create the SetupIntent. `usage: 'off_session'` is critical — it
+    //    tells Stripe this card will be charged later without the customer
+    //    present (i.e. when the 5th referral triggers /start-billing).
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customer.id,
+      payment_method_types: ['card'],
+      usage: 'off_session',
+      metadata: { user_id, plan_type: plan_type || 'provider_founder' },
+    });
+
+    res.json({
+      client_secret: setupIntent.client_secret,
+      customer_id: customer.id,
+      setup_intent_id: setupIntent.id,
+    });
   } catch (err) {
+    console.error('create-setup-intent:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/confirm-setup-intent', requireUser, async (req, res) => {
+  try {
+    const { setup_intent_id } = req.body;
+    if (!setup_intent_id) return res.status(400).json({ error: 'setup_intent_id is required' });
+
+    // Retrieve the SetupIntent from Stripe to verify it succeeded and that
+    // it belongs to the authenticated user. Never trust the client.
+    const si = await stripe.setupIntents.retrieve(setup_intent_id);
+    if (!si || si.metadata?.user_id !== req.authUser.id) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    if (si.status !== 'succeeded') {
+      return res.status(400).json({ error: `SetupIntent status is ${si.status}` });
+    }
+
+    // Make this card the default for invoices billed later.
+    if (si.payment_method && si.customer) {
+      await stripe.customers.update(si.customer, {
+        invoice_settings: { default_payment_method: si.payment_method },
+      });
+    }
+
+    await supabase
+      .from('subscriptions')
+      .update({
+        payment_method_pending: false,
+        stripe_customer_id: si.customer,
+        status: 'trialing',
+        updated_at: new Date().toISOString(),
+      })
+      .eq('therapist_id', req.authUser.id);
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('confirm-setup-intent:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -342,10 +514,12 @@ const PRICES = {
 };
 const CLINIC_BASE_PROVIDERS_INCLUDED = 5;
 
-app.post('/start-billing', async (req, res) => {
+app.post('/start-billing', requireUser, async (req, res) => {
   try {
     const { stripe_customer_id, plan_type, provider_count } = req.body;
     if (!stripe_customer_id) return res.status(400).json({ error: 'stripe_customer_id is required' });
+    const { data: ownedSub } = await supabase.from('subscriptions').select('therapist_id').eq('stripe_customer_id', stripe_customer_id).single();
+    if (!ownedSub || ownedSub.therapist_id !== req.authUser.id) return res.status(403).json({ error: 'Forbidden' });
 
     let founderItems, standardItems;
     if (plan_type === 'clinic') {
@@ -376,11 +550,13 @@ app.post('/start-billing', async (req, res) => {
   }
 });
 
-app.post('/create-portal-session', async (req, res) => {
+app.post('/create-portal-session', requireUser, async (req, res) => {
   try {
     const { stripe_customer_id, return_url } = req.body;
     if (!stripe_customer_id) return res.status(400).json({ error: 'stripe_customer_id is required' });
-    const session = await stripe.billingPortal.sessions.create({ customer: stripe_customer_id, return_url: return_url || 'https://matchedcare.us' });
+    const { data: ownedSub } = await supabase.from('subscriptions').select('therapist_id').eq('stripe_customer_id', stripe_customer_id).single();
+    if (!ownedSub || ownedSub.therapist_id !== req.authUser.id) return res.status(403).json({ error: 'Forbidden' });
+    const session = await stripe.billingPortal.sessions.create({ customer: stripe_customer_id, return_url: allowedReturnUrl(return_url) });
     res.json({ url: session.url });
   } catch (err) {
     res.status(500).json({ error: err.message });
