@@ -120,11 +120,20 @@ async function userOptedInSMS(userId) {
   return null;
 }
 
-app.use(cors({
-  origin: ['https://matchedcare.us', 'https://www.matchedcare.us', 'http://localhost:5173', 'http://localhost:3000'],
-  methods: ['GET', 'POST'],
-  credentials: true
-}));
+const corsOptions = {
+  origin: [
+    'http://localhost:3000',
+    'http://localhost:3001',
+    'http://localhost:5173',
+    'https://matchedcare.us',
+    'https://www.matchedcare.us',
+  ],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 
 // Stripe webhook (raw body)
 app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
