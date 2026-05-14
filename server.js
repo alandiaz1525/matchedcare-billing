@@ -148,7 +148,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     case 'checkout.session.completed': {
       const session = event.data.object;
       if (session.mode === 'setup' && session.metadata?.user_id) {
-        await supabase.from('subscriptions').update({ stripe_customer_id: session.customer, status: 'trialing', updated_at: new Date().toISOString() }).eq('therapist_id', session.metadata.user_id);
+        await supabase.from('subscriptions').update({ stripe_customer_id: session.customer, status: 'active', updated_at: new Date().toISOString() }).eq('therapist_id', session.metadata.user_id);
       }
       break;
     }
@@ -170,7 +170,7 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
           .update({
             payment_method_pending: false,
             stripe_customer_id: si.customer,
-            status: 'trialing',
+            status: 'active',
             updated_at: new Date().toISOString(),
           })
           .eq('therapist_id', userId);
@@ -196,6 +196,25 @@ app.use(express.json());
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'matchedcare-billing', email: !!process.env.RESEND_API_KEY, sms: !!twilioClient });
+});
+
+app.get('/npi-lookup', async (req, res) => {
+  try {
+    const number = String(req.query.number || '').trim();
+    if (!/^\d{10}$/.test(number)) {
+      return res.status(400).json({ error: 'number must be exactly 10 digits' });
+    }
+    const url = `https://npiregistry.cms.hhs.gov/api/?version=2.1&number=${number}&limit=1`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      return res.status(502).json({ error: `NPI registry returned ${response.status}` });
+    }
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    console.error('npi-lookup:', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -500,7 +519,7 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
       .update({
         payment_method_pending: false,
         stripe_customer_id: si.customer,
-        status: 'trialing',
+        status: 'active',
         updated_at: new Date().toISOString(),
       })
       .eq('therapist_id', req.authUser.id);
