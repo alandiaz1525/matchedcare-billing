@@ -569,11 +569,32 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
   }
 });
 
+// Each plan family has a founder phase (first 3 months) and a standard
+// phase (every month after that). startBillingForTherapist installs a
+// Stripe subscription_schedule that auto-transitions between them.
 const PLAN_PRICES = {
-  provider_founder: { base: 'price_1TeLZdPtdczvTubYtnbKnC9P' },
-  aba_founder: { base: 'price_1TeLZPPtdczvTubYVxI6Vifk' },
-  mh_group_founder: { base: 'price_1TeLZZPtdczvTubYTp7HOgok', perProvider: 'price_1TeLZXPtdczvTubYMmArl1Ds' },
+  provider_founder: {
+    founder: { base: 'price_1TeLZdPtdczvTubYtnbKnC9P' },
+    standard: { base: 'price_1TeLZbPtdczvTubYegElJ7Wa' },
+  },
+  aba_founder: {
+    founder: { base: 'price_1TeLZPPtdczvTubYVxI6Vifk' },
+    standard: { base: 'price_1TeLZMPtdczvTubYctDtVhFb' },
+  },
+  mh_group_founder: {
+    founder: { base: 'price_1TeLZZPtdczvTubYTp7HOgok', perProvider: 'price_1TeLZXPtdczvTubYMmArl1Ds' },
+    standard: { base: 'price_1TeLZUPtdczvTubYA2dJQGHF', perProvider: 'price_1TeLZSPtdczvTubYolDwdmEd' },
+  },
 };
+
+function buildPhaseItems(phase, providerCount) {
+  const items = [{ price: phase.base }];
+  if (phase.perProvider) {
+    const qty = Math.max(1, Number(providerCount) || 1);
+    items.push({ price: phase.perProvider, quantity: qty });
+  }
+  return items;
+}
 
 async function startBillingForTherapist({ therapist_id, plan_type, provider_count }) {
   const { data: sub, error: subErr } = await supabase
@@ -594,32 +615,53 @@ async function startBillingForTherapist({ therapist_id, plan_type, provider_coun
   const defaultPm = customer?.invoice_settings?.default_payment_method;
   if (!defaultPm) throw new Error('Customer has no default payment method saved');
 
-  const items = [{ price: plan.base }];
-  if (plan.perProvider) {
-    const qty = Math.max(1, Number(provider_count ?? sub.provider_count) || 1);
-    items.push({ price: plan.perProvider, quantity: qty });
-  }
+  const qty = provider_count ?? sub.provider_count;
 
   try {
-    const subscription = await stripe.subscriptions.create({
+    // Two-phase schedule: 3 months at founder pricing, then standard forever.
+    // end_behavior='release' lets the subscription continue standalone after
+    // the last phase finishes (which never expires).
+    const schedule = await stripe.subscriptionSchedules.create({
       customer: sub.stripe_customer_id,
-      items,
-      default_payment_method: defaultPm,
+      start_date: 'now',
+      end_behavior: 'release',
+      default_settings: { default_payment_method: defaultPm },
+      phases: [
+        { items: buildPhaseItems(plan.founder, qty), iterations: 3 },
+        { items: buildPhaseItems(plan.standard, qty) },
+      ],
       metadata: { therapist_id, plan_type },
     });
+
+    const subscriptionId = schedule.subscription;
+    let status = 'active';
+    let founderEndsAt = null;
+    if (subscriptionId) {
+      try {
+        const liveSub = await stripe.subscriptions.retrieve(subscriptionId);
+        status = liveSub.status || status;
+      } catch (e) {
+        console.warn('post-create subscription retrieve failed:', e.message);
+      }
+    }
+    // Phase[0].end_date is when founder pricing ends (in Unix seconds).
+    if (schedule.phases?.[0]?.end_date) {
+      founderEndsAt = new Date(schedule.phases[0].end_date * 1000).toISOString();
+    }
 
     await supabase
       .from('subscriptions')
       .update({
-        stripe_subscription_id: subscription.id,
+        stripe_subscription_id: subscriptionId,
         billing_started_at: new Date().toISOString(),
-        status: subscription.status === 'active' ? 'active' : subscription.status,
+        founder_ends_at: founderEndsAt,
+        status,
         billing_error: null,
         updated_at: new Date().toISOString(),
       })
       .eq('therapist_id', therapist_id);
 
-    return { success: true, subscription_id: subscription.id, status: subscription.status };
+    return { success: true, subscription_id: subscriptionId, schedule_id: schedule.id, status };
   } catch (err) {
     console.error(`start-billing failed for ${therapist_id}:`, err.message);
     await supabase
@@ -633,7 +675,43 @@ async function startBillingForTherapist({ therapist_id, plan_type, provider_coun
   }
 }
 
-app.post('/start-billing', async (req, res) => {
+// Shared cron-token middleware. Apply to endpoints intended for internal
+// callers (cron, ops scripts) so they can't be hit from the public internet
+// without the secret.
+function requireCronToken(req, res, next) {
+  const expected = process.env.CRON_SECRET;
+  if (!expected) return res.status(503).json({ error: 'Server cron secret is not configured' });
+  const provided = req.header('x-cron-token') || req.query.token;
+  if (provided !== expected) return res.status(401).json({ error: 'Invalid cron token' });
+  next();
+}
+
+// Shared runner used by both /check-billing and the internal interval cron.
+async function runBillingCheck() {
+  const { data: rows, error } = await supabase
+    .from('subscriptions')
+    .select('therapist_id, plan_type, provider_count')
+    .eq('billing_ready', true)
+    .is('stripe_subscription_id', null);
+  if (error) throw error;
+
+  const results = [];
+  for (const row of rows || []) {
+    try {
+      const result = await startBillingForTherapist({
+        therapist_id: row.therapist_id,
+        plan_type: row.plan_type,
+        provider_count: row.provider_count,
+      });
+      results.push({ therapist_id: row.therapist_id, ...result });
+    } catch (err) {
+      results.push({ therapist_id: row.therapist_id, error: err.message });
+    }
+  }
+  return { checked: (rows || []).length, results };
+}
+
+app.post('/start-billing', requireCronToken, async (req, res) => {
   try {
     const { therapist_id, plan_type, provider_count } = req.body;
     if (!therapist_id || !plan_type) {
@@ -646,50 +724,60 @@ app.post('/start-billing', async (req, res) => {
   }
 });
 
-app.get('/check-billing', async (req, res) => {
+app.get('/check-billing', requireCronToken, async (req, res) => {
   try {
-    const { data: rows, error } = await supabase
-      .from('subscriptions')
-      .select('therapist_id, plan_type, provider_count')
-      .eq('billing_ready', true)
-      .is('stripe_subscription_id', null);
-    if (error) throw error;
-
-    const results = [];
-    for (const row of rows || []) {
-      try {
-        const result = await startBillingForTherapist({
-          therapist_id: row.therapist_id,
-          plan_type: row.plan_type,
-          provider_count: row.provider_count,
-        });
-        results.push({ therapist_id: row.therapist_id, ...result });
-      } catch (err) {
-        results.push({ therapist_id: row.therapist_id, error: err.message });
-      }
-    }
-
-    res.json({ checked: (rows || []).length, results });
+    const result = await runBillingCheck();
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// /create-portal-session deliberately ignores any customer id from the
+// client. The customer is looked up from the authed user's subscription row
+// to prevent a leaked or guessed stripe_customer_id from opening another
+// user's billing portal.
 app.post('/create-portal-session', requireUser, async (req, res) => {
   try {
-    const { stripe_customer_id, return_url } = req.body;
-    if (!stripe_customer_id) return res.status(400).json({ error: 'stripe_customer_id is required' });
-    const { data: ownedSub } = await supabase.from('subscriptions').select('therapist_id').eq('stripe_customer_id', stripe_customer_id).single();
-    if (!ownedSub || ownedSub.therapist_id !== req.authUser.id) return res.status(403).json({ error: 'Forbidden' });
-    const session = await stripe.billingPortal.sessions.create({ customer: stripe_customer_id, return_url: allowedReturnUrl(return_url) });
+    const { return_url } = req.body || {};
+    const { data: sub, error } = await supabase
+      .from('subscriptions')
+      .select('stripe_customer_id')
+      .eq('therapist_id', req.authUser.id)
+      .single();
+    if (error || !sub?.stripe_customer_id) {
+      return res.status(404).json({ error: 'No Stripe customer for this user' });
+    }
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: allowedReturnUrl(return_url),
+    });
     res.json({ url: session.url });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
+// Internal interval cron. Runs the same logic as /check-billing every 10
+// minutes so the safety net fires without an external scheduler. If the
+// process restarts the timer resets but no state is lost (the query is
+// idempotent).
+const BILLING_CRON_MS = 10 * 60 * 1000;
+async function runBillingCronTick() {
+  try {
+    const result = await runBillingCheck();
+    if (result.checked > 0) {
+      console.log(`billing cron: processed ${result.checked} pending subscriptions`);
+    }
+  } catch (err) {
+    console.error('billing cron error:', err.message);
+  }
+}
+setInterval(runBillingCronTick, BILLING_CRON_MS);
+
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
   console.log(`Email: ${process.env.RESEND_API_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`SMS: ${twilioClient ? 'ENABLED' : 'DISABLED'}`);
+  console.log(`Billing cron: interval=${BILLING_CRON_MS / 1000}s`);
 });
