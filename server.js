@@ -188,6 +188,38 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
       await supabase.from('subscriptions').update({ status: 'cancelled', updated_at: new Date().toISOString() }).eq('stripe_subscription_id', event.data.object.id);
       break;
     }
+    case 'invoice.payment_failed': {
+      const invoice = event.data.object;
+      const reason = invoice.last_finalization_error?.message
+        || invoice.last_payment_error?.message
+        || `Invoice ${invoice.id} payment failed (attempt ${invoice.attempt_count})`;
+      const subId = invoice.subscription;
+      const customerId = invoice.customer;
+      try {
+        if (subId) {
+          await supabase
+            .from('subscriptions')
+            .update({
+              status: 'past_due',
+              billing_error: reason,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('stripe_subscription_id', subId);
+        } else if (customerId) {
+          await supabase
+            .from('subscriptions')
+            .update({
+              status: 'past_due',
+              billing_error: reason,
+              updated_at: new Date().toISOString(),
+            })
+            .eq('stripe_customer_id', customerId);
+        }
+      } catch (e) {
+        console.error('invoice.payment_failed update error:', e.message);
+      }
+      break;
+    }
   }
   res.json({ received: true });
 });
@@ -438,10 +470,13 @@ app.post('/test-sms', requireAdmin, async (req, res) => {
 
 app.post('/create-setup-intent', requireUser, async (req, res) => {
   try {
-    const { plan_type } = req.body;
+    const { plan_type, provider_count } = req.body;
     const user_id = req.authUser.id;
     const email = req.authUser.email;
     if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
+
+    const safePlanType = plan_type || 'provider_founder';
+    const safeProviderCount = Math.max(1, Number(provider_count) || 1);
 
     // 1. Find or create the Stripe Customer for this user.
     let customer;
@@ -451,19 +486,22 @@ app.post('/create-setup-intent', requireUser, async (req, res) => {
     } else {
       customer = await stripe.customers.create({
         email,
-        metadata: { user_id, plan_type: plan_type || 'provider_founder' },
+        metadata: { user_id, plan_type: safePlanType },
       });
     }
 
     // 2. UPSERT the subscriptions row so we never silently drop the customer
     //    id when the row hasn't been created yet (e.g. a brand-new signup).
+    //    provider_count is persisted here so /start-billing can multiply the
+    //    MH-group addon by the right headcount.
     await supabase
       .from('subscriptions')
       .upsert(
         {
           therapist_id: user_id,
           stripe_customer_id: customer.id,
-          plan_type: plan_type || 'provider_founder',
+          plan_type: safePlanType,
+          provider_count: safeProviderCount,
           status: 'pending',
           payment_method_pending: true,
           updated_at: new Date().toISOString(),
@@ -478,7 +516,7 @@ app.post('/create-setup-intent', requireUser, async (req, res) => {
       customer: customer.id,
       payment_method_types: ['card'],
       usage: 'off_session',
-      metadata: { user_id, plan_type: plan_type || 'provider_founder' },
+      metadata: { user_id, plan_type: safePlanType },
     });
 
     res.json({
