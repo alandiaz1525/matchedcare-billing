@@ -181,7 +181,37 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     case 'customer.subscription.updated': {
       const sub = event.data.object;
       const { data } = await supabase.from('subscriptions').select('therapist_id').eq('stripe_customer_id', sub.customer).single();
-      if (data) await supabase.from('subscriptions').update({ stripe_subscription_id: sub.id, status: sub.status === 'active' ? 'active' : sub.status, updated_at: new Date().toISOString() }).eq('therapist_id', data.therapist_id);
+      if (data) {
+        const patch = {
+          stripe_subscription_id: sub.id,
+          status: sub.status,
+          current_period_end: sub.current_period_end
+            ? new Date(sub.current_period_end * 1000).toISOString()
+            : null,
+          updated_at: new Date().toISOString(),
+        };
+        // Detect plan_type from the first item's price id by reverse-looking
+        // up PLAN_PRICES. Lets admin changes in the Stripe dashboard flow
+        // back to our DB instead of going stale.
+        const firstPriceId = sub.items?.data?.[0]?.price?.id;
+        if (firstPriceId) {
+          for (const [planType, phases] of Object.entries(PLAN_PRICES)) {
+            const all = [phases.founder, phases.standard];
+            if (all.some((p) => p?.base === firstPriceId)) {
+              patch.plan_type = planType;
+              break;
+            }
+          }
+        }
+        // Quantity for MH-group addons is the per-provider headcount.
+        const addonItem = (sub.items?.data || []).find((i) =>
+          Object.values(PLAN_PRICES).some(
+            (p) => p.founder?.perProvider === i.price?.id || p.standard?.perProvider === i.price?.id
+          )
+        );
+        if (addonItem?.quantity) patch.provider_count = addonItem.quantity;
+        await supabase.from('subscriptions').update(patch).eq('therapist_id', data.therapist_id);
+      }
       break;
     }
     case 'customer.subscription.deleted': {
