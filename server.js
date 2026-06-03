@@ -531,48 +531,107 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
   }
 });
 
-// Clinic base plan includes the first 5 providers; the addon price bills each provider beyond 5.
-const PRICES = {
-  provider_founder: 'price_1TP9VOPtdczvTubYBbx3FaOR',
-  provider_standard: 'price_1TP9VOPtdczvTubYD0iO68q8',
-  clinic_founder_base: 'price_1TP9VPPtdczvTubYSorA5S9j',
-  clinic_founder_addon: 'price_1TP9VQPtdczvTubYWj6HlaH5',
-  clinic_standard_base: 'price_1TP9VRPtdczvTubYkTZhH07J',
-  clinic_standard_addon: 'price_1TP9VSPtdczvTubYDTujrcPQ',
+const PLAN_PRICES = {
+  provider_founder: { base: 'price_1TeLZdPtdczvTubYtnbKnC9P' },
+  aba_founder: { base: 'price_1TeLZPPtdczvTubYVxI6Vifk' },
+  mh_group_founder: { base: 'price_1TeLZZPtdczvTubYTp7HOgok', perProvider: 'price_1TeLZXPtdczvTubYMmArl1Ds' },
 };
-const CLINIC_BASE_PROVIDERS_INCLUDED = 5;
 
-app.post('/start-billing', requireUser, async (req, res) => {
+async function startBillingForTherapist({ therapist_id, plan_type, provider_count }) {
+  const { data: sub, error: subErr } = await supabase
+    .from('subscriptions')
+    .select('stripe_customer_id, stripe_subscription_id, provider_count')
+    .eq('therapist_id', therapist_id)
+    .single();
+  if (subErr || !sub) throw new Error(`Subscription not found for therapist ${therapist_id}`);
+  if (sub.stripe_subscription_id) {
+    return { already_active: true, subscription_id: sub.stripe_subscription_id };
+  }
+  if (!sub.stripe_customer_id) throw new Error('No stripe_customer_id on subscription record');
+
+  const plan = PLAN_PRICES[plan_type];
+  if (!plan) throw new Error(`Unknown plan_type: ${plan_type}`);
+
+  const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+  const defaultPm = customer?.invoice_settings?.default_payment_method;
+  if (!defaultPm) throw new Error('Customer has no default payment method saved');
+
+  const items = [{ price: plan.base }];
+  if (plan.perProvider) {
+    const qty = Math.max(1, Number(provider_count ?? sub.provider_count) || 1);
+    items.push({ price: plan.perProvider, quantity: qty });
+  }
+
   try {
-    const { stripe_customer_id, plan_type, provider_count } = req.body;
-    if (!stripe_customer_id) return res.status(400).json({ error: 'stripe_customer_id is required' });
-    const { data: ownedSub } = await supabase.from('subscriptions').select('therapist_id').eq('stripe_customer_id', stripe_customer_id).single();
-    if (!ownedSub || ownedSub.therapist_id !== req.authUser.id) return res.status(403).json({ error: 'Forbidden' });
+    const subscription = await stripe.subscriptions.create({
+      customer: sub.stripe_customer_id,
+      items,
+      default_payment_method: defaultPm,
+      metadata: { therapist_id, plan_type },
+    });
 
-    let founderItems, standardItems;
-    if (plan_type === 'clinic') {
-      const addonQty = Math.max(0, (Number(provider_count) || 0) - CLINIC_BASE_PROVIDERS_INCLUDED);
-      founderItems = [{ price: PRICES.clinic_founder_base }];
-      standardItems = [{ price: PRICES.clinic_standard_base }];
-      if (addonQty > 0) {
-        founderItems.push({ price: PRICES.clinic_founder_addon, quantity: addonQty });
-        standardItems.push({ price: PRICES.clinic_standard_addon, quantity: addonQty });
+    await supabase
+      .from('subscriptions')
+      .update({
+        stripe_subscription_id: subscription.id,
+        billing_started_at: new Date().toISOString(),
+        status: subscription.status === 'active' ? 'active' : subscription.status,
+        billing_error: null,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('therapist_id', therapist_id);
+
+    return { success: true, subscription_id: subscription.id, status: subscription.status };
+  } catch (err) {
+    console.error(`start-billing failed for ${therapist_id}:`, err.message);
+    await supabase
+      .from('subscriptions')
+      .update({
+        billing_error: err.message,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('therapist_id', therapist_id);
+    throw err;
+  }
+}
+
+app.post('/start-billing', async (req, res) => {
+  try {
+    const { therapist_id, plan_type, provider_count } = req.body;
+    if (!therapist_id || !plan_type) {
+      return res.status(400).json({ error: 'therapist_id and plan_type are required' });
+    }
+    const result = await startBillingForTherapist({ therapist_id, plan_type, provider_count });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/check-billing', async (req, res) => {
+  try {
+    const { data: rows, error } = await supabase
+      .from('subscriptions')
+      .select('therapist_id, plan_type, provider_count')
+      .eq('billing_ready', true)
+      .is('stripe_subscription_id', null);
+    if (error) throw error;
+
+    const results = [];
+    for (const row of rows || []) {
+      try {
+        const result = await startBillingForTherapist({
+          therapist_id: row.therapist_id,
+          plan_type: row.plan_type,
+          provider_count: row.provider_count,
+        });
+        results.push({ therapist_id: row.therapist_id, ...result });
+      } catch (err) {
+        results.push({ therapist_id: row.therapist_id, error: err.message });
       }
-    } else {
-      founderItems = [{ price: PRICES.provider_founder }];
-      standardItems = [{ price: PRICES.provider_standard }];
     }
 
-    const schedule = await stripe.subscriptionSchedules.create({
-      customer: stripe_customer_id,
-      start_date: 'now',
-      end_behavior: 'release',
-      phases: [
-        { items: founderItems, iterations: 3 },
-        { items: standardItems },
-      ],
-    });
-    res.json({ schedule_id: schedule.id, subscription_id: schedule.subscription, status: 'active' });
+    res.json({ checked: (rows || []).length, results });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
