@@ -81,6 +81,38 @@ function safeError(res, route, err, fallback, status = 500) {
   return res.status(status).json({ error: fallback });
 }
 
+// Shared per-IP rate limiter. Returns a function that returns true if the
+// caller is within budget. Each limiter has its own bounded Map keyed by IP.
+function makeRateLimiter(windowMs, maxHits) {
+  const hits = new Map();
+  return function check(ip) {
+    const now = Date.now();
+    const recent = (hits.get(ip) || []).filter((t) => now - t < windowMs);
+    if (recent.length >= maxHits) {
+      hits.set(ip, recent);
+      return false;
+    }
+    recent.push(now);
+    hits.set(ip, recent);
+    return true;
+  };
+}
+
+// Express middleware that plugs a limiter into the route chain. Run BEFORE
+// auth so we don't pay the auth lookup cost for spammers.
+function rateLimit(limiter) {
+  return (req, res, next) => {
+    const ipHeader = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+    const ip = String(ipHeader).split(',')[0].trim() || 'unknown';
+    if (!limiter(ip)) return res.status(429).json({ error: 'Too many requests. Please slow down.' });
+    next();
+  };
+}
+
+const setupIntentLimiter = makeRateLimiter(60 * 1000, 10);
+const notifyMatchLimiter = makeRateLimiter(60 * 1000, 20);
+const npiLookupLimiter = makeRateLimiter(60 * 1000, 10);
+
 // In-memory webhook idempotency. Stripe retries failed events on an
 // exponential backoff (first retry ~1h later) — if we already processed an
 // event, we should ack it without re-running the side effects. Bounded set so
@@ -292,7 +324,7 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'matchedcare-billing', email: !!process.env.RESEND_API_KEY, sms: !!twilioClient });
 });
 
-app.get('/npi-lookup', async (req, res) => {
+app.get('/npi-lookup', rateLimit(npiLookupLimiter), async (req, res) => {
   try {
     const number = String(req.query.number || '').trim();
     if (!/^\d{10}$/.test(number)) {
@@ -390,7 +422,7 @@ function welcomeEmail({ name, role }) {
 // NOTIFICATION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.post('/notify-match', requireUser, async (req, res) => {
+app.post('/notify-match', rateLimit(notifyMatchLimiter), requireUser, async (req, res) => {
   try {
     const { match_id, match_type } = req.body;
     if (!match_id) return res.status(400).json({ error: 'match_id is required' });
@@ -638,7 +670,7 @@ app.post('/test-sms', requireAdmin, async (req, res) => {
 // STRIPE ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
 
-app.post('/create-setup-intent', requireUser, async (req, res) => {
+app.post('/create-setup-intent', rateLimit(setupIntentLimiter), requireUser, async (req, res) => {
   try {
     const { plan_type, provider_count } = req.body;
     const user_id = req.authUser.id;
