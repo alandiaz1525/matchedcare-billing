@@ -73,6 +73,34 @@ function safeEmail(value) {
   return /^[^\s@<>"']+@[^\s@<>"']+\.[^\s@<>"']+$/.test(email) ? email : '';
 }
 
+// Log the real error server-side, return a sanitized message to the client.
+// Stripe and Supabase error messages can include internal details (rate-limit
+// info, table names, payment_method IDs, etc.) that we shouldn't echo back.
+function safeError(res, route, err, fallback, status = 500) {
+  console.error(`${route}:`, err?.message || err);
+  return res.status(status).json({ error: fallback });
+}
+
+// In-memory webhook idempotency. Stripe retries failed events on an
+// exponential backoff (first retry ~1h later) — if we already processed an
+// event, we should ack it without re-running the side effects. Bounded set so
+// memory doesn't grow without limit; events older than the cap can theoretically
+// double-process if Stripe retries them after a long gap, but that's a far
+// smaller risk than the current "every retry double-processes" state.
+const WEBHOOK_EVENT_CAP = 1000;
+const processedWebhookEvents = new Set();
+const processedWebhookOrder = [];
+function seenWebhookEvent(eventId) {
+  if (processedWebhookEvents.has(eventId)) return true;
+  processedWebhookEvents.add(eventId);
+  processedWebhookOrder.push(eventId);
+  if (processedWebhookOrder.length > WEBHOOK_EVENT_CAP) {
+    const old = processedWebhookOrder.shift();
+    processedWebhookEvents.delete(old);
+  }
+  return false;
+}
+
 // Twilio SMS client (only init if credentials exist)
 let twilioClient = null;
 let TWILIO_PHONE = process.env.TWILIO_PHONE_NUMBER || null;
@@ -143,6 +171,10 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+  // Stripe retries on failure — skip if already processed.
+  if (seenWebhookEvent(event.id)) {
+    return res.json({ received: true, duplicate: true });
   }
   switch (event.type) {
     case 'checkout.session.completed': {
@@ -274,8 +306,7 @@ app.get('/npi-lookup', async (req, res) => {
     const data = await response.json();
     res.json(data);
   } catch (err) {
-    console.error('npi-lookup:', err.message);
-    res.status(500).json({ error: err.message });
+    safeError(res, 'npi-lookup', err, 'NPI lookup failed.');
   }
 });
 
@@ -441,8 +472,7 @@ app.post('/notify-match', requireUser, async (req, res) => {
       res.json({ success: true, type: 'provider', emails_sent: emailsSent, sms_sent: smsSent });
     }
   } catch (err) {
-    console.error('Error sending notifications:', err.message);
-    res.status(500).json({ error: err.message });
+    safeError(res, 'notify-match', err, 'Could not send notifications.');
   }
 });
 
@@ -458,7 +488,7 @@ app.post('/send-welcome', requireUser, async (req, res) => {
     }
     res.json({ success: true });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'send-welcome', err, 'Could not send welcome email.');
   }
 });
 
@@ -469,7 +499,7 @@ app.post('/send-sms', requireAdmin, async (req, res) => {
     const sent = await sendSMS(to, message);
     res.json({ success: sent });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'send-sms', err, 'Could not send SMS.');
   }
 });
 
@@ -479,7 +509,7 @@ app.post('/test-email', requireAdmin, async (req, res) => {
     await resend.emails.send({ from: FROM_EMAIL, to: testTo, subject: 'MatchedCare — Test Email', html: emailWrapper(`<h1>Email is working!</h1><p class="subtitle">Your Resend integration is configured correctly.</p>`) });
     res.json({ success: true, sent_to: testTo });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'test-email', err, 'Test email failed.');
   }
 });
 
@@ -552,7 +582,7 @@ app.post('/test-sms', requireAdmin, async (req, res) => {
     const sent = await sendSMS(testTo, 'MatchedCare: SMS notifications are working! This is a test message.');
     res.json({ success: sent, sent_to: testTo });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'test-sms', err, 'Test SMS failed.');
   }
 });
 
@@ -617,8 +647,7 @@ app.post('/create-setup-intent', requireUser, async (req, res) => {
       setup_intent_id: setupIntent.id,
     });
   } catch (err) {
-    console.error('create-setup-intent:', err.message);
-    res.status(500).json({ error: err.message });
+    safeError(res, 'create-setup-intent', err, 'Could not start payment setup. Please try again.');
   }
 });
 
@@ -656,8 +685,7 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error('confirm-setup-intent:', err.message);
-    res.status(500).json({ error: err.message });
+    safeError(res, 'confirm-setup-intent', err, 'Could not confirm payment method.');
   }
 });
 
@@ -708,8 +736,7 @@ app.post('/verify-payment-method', requireUser, async (req, res) => {
     }
     return res.json({ verified: false, reason: 'no_payment_method' });
   } catch (err) {
-    console.error('verify-payment-method:', err.message);
-    res.status(500).json({ error: err.message });
+    safeError(res, 'verify-payment-method', err, 'Could not verify payment method.');
   }
 });
 
@@ -864,7 +891,7 @@ app.post('/start-billing', requireCronToken, async (req, res) => {
     const result = await startBillingForTherapist({ therapist_id, plan_type, provider_count });
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'start-billing', err, 'Could not start billing.');
   }
 });
 
@@ -873,7 +900,7 @@ app.get('/check-billing', requireCronToken, async (req, res) => {
     const result = await runBillingCheck();
     res.json(result);
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'check-billing', err, 'Billing check failed.');
   }
 });
 
@@ -898,7 +925,7 @@ app.post('/create-portal-session', requireUser, async (req, res) => {
     });
     res.json({ url: session.url });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    safeError(res, 'create-portal-session', err, 'Could not open billing portal.');
   }
 });
 
