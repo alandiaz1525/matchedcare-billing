@@ -155,7 +155,7 @@ async function sendSMS(to, message) {
   }
   try {
     await twilioClient.messages.create({ body: message, from: TWILIO_PHONE, to: phone });
-    console.log('SMS sent to:', phone);
+    console.log('SMS sent to:', phone.replace(/(\+?\d{1,3})\d+(\d{4})/, '$1***$2'));
     return true;
   } catch (err) {
     console.error('SMS error:', err.message);
@@ -599,7 +599,7 @@ app.post('/test-email', requireAdmin, async (req, res) => {
 // Public contact form. Per-instance in-memory rate limit (5 / 10 min / IP) —
 // not a fortress, but blocks the trivial spam case. Validates server-side
 // because the contact form is unauthenticated.
-const CONTACT_TO = 'alandiaz.wb@gmail.com';
+const CONTACT_TO = process.env.CONTACT_TO_EMAIL || 'alandiaz.wb@gmail.com';
 const CONTACT_RATE_WINDOW_MS = 10 * 60 * 1000;
 const CONTACT_RATE_MAX = 5;
 const contactRateHits = new Map();
