@@ -324,6 +324,57 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'matchedcare-billing', email: !!process.env.RESEND_API_KEY, sms: !!twilioClient });
 });
 
+// Deep health: actually pings each upstream dependency and reports per-check
+// status. Use this from uptime monitors instead of /health when you want to
+// catch "Resend down" / "Stripe degraded" / "Supabase RLS broken" before users
+// do. Probes run in parallel with a 3s per-check timeout so a single hung
+// dependency can't tarpit the response.
+async function probeDependency(name, fn, timeoutMs = 3000) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+  });
+  try {
+    await Promise.race([fn(), timeout]);
+    return { name, status: 'ok' };
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.error(`health-deep ${name}:`, msg);
+    return { name, status: msg === 'timeout' ? 'timeout' : 'down' };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.get('/health/deep', async (req, res) => {
+  const checks = await Promise.all([
+    probeDependency('supabase', async () => {
+      const { error } = await supabase.from('subscriptions').select('therapist_id').limit(1);
+      if (error) throw new Error(error.message);
+    }),
+    probeDependency('stripe', async () => {
+      await stripe.balance.retrieve();
+    }),
+    probeDependency('resend', async () => {
+      if (!process.env.RESEND_API_KEY) throw new Error('not configured');
+      const r = await fetch('https://api.resend.com/domains', {
+        headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` },
+      });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    }),
+    probeDependency('twilio', async () => {
+      if (!twilioClient || !process.env.TWILIO_ACCOUNT_SID) throw new Error('not configured');
+      await twilioClient.api.accounts(process.env.TWILIO_ACCOUNT_SID).fetch();
+    }),
+  ]);
+  const anyDown = checks.some((c) => c.status !== 'ok');
+  res.status(anyDown ? 503 : 200).json({
+    status: anyDown ? 'degraded' : 'ok',
+    service: 'matchedcare-billing',
+    checks,
+  });
+});
+
 app.get('/npi-lookup', rateLimit(npiLookupLimiter), async (req, res) => {
   try {
     const number = String(req.query.number || '').trim();
