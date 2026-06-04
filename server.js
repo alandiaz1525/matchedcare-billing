@@ -483,6 +483,68 @@ app.post('/test-email', requireAdmin, async (req, res) => {
   }
 });
 
+// Public contact form. Per-instance in-memory rate limit (5 / 10 min / IP) —
+// not a fortress, but blocks the trivial spam case. Validates server-side
+// because the contact form is unauthenticated.
+const CONTACT_TO = 'alandiaz.wb@gmail.com';
+const CONTACT_RATE_WINDOW_MS = 10 * 60 * 1000;
+const CONTACT_RATE_MAX = 5;
+const contactRateHits = new Map();
+
+function contactRateOk(ip) {
+  const now = Date.now();
+  const recent = (contactRateHits.get(ip) || []).filter((t) => now - t < CONTACT_RATE_WINDOW_MS);
+  if (recent.length >= CONTACT_RATE_MAX) {
+    contactRateHits.set(ip, recent);
+    return false;
+  }
+  recent.push(now);
+  contactRateHits.set(ip, recent);
+  return true;
+}
+
+app.post('/contact', async (req, res) => {
+  try {
+    const ipHeader = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+    const ip = String(ipHeader).split(',')[0].trim() || 'unknown';
+    if (!contactRateOk(ip)) {
+      return res.status(429).json({ error: 'Too many messages. Please try again later.' });
+    }
+
+    const name = String(req.body?.name || '').trim().slice(0, 100);
+    const email = safeEmail(req.body?.email);
+    const subject = String(req.body?.subject || '').trim().replace(/[\r\n]+/g, ' ').slice(0, 200);
+    const message = String(req.body?.message || '').trim().slice(0, 5000);
+
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: 'Name, valid email, and message are required.' });
+    }
+
+    const subjectLine = subject ? `Contact form: ${subject}` : 'Contact form message';
+    const html = emailWrapper(`
+      <h1>New contact form submission</h1>
+      <p class="subtitle">Sent from the MatchedCare contact page.</p>
+      <div class="info-box"><p class="info-label">From</p><p class="info-value">${escapeHtml(name)}</p>
+      <p style="font-size:13px;color:#6E7178;margin:4px 0 0">${escapeHtml(email)}</p></div>
+      ${subject ? `<div class="info-box"><p class="info-label">Subject</p><p class="info-value">${escapeHtml(subject)}</p></div>` : ''}
+      <div class="highlight"><p style="white-space:pre-wrap">${escapeHtml(message)}</p></div>
+    `);
+
+    await resend.emails.send({
+      from: FROM_EMAIL,
+      to: CONTACT_TO,
+      reply_to: email,
+      subject: subjectLine,
+      html,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('contact form error:', err.message);
+    res.status(500).json({ error: 'Could not send message. Please try again.' });
+  }
+});
+
 app.post('/test-sms', requireAdmin, async (req, res) => {
   try {
     const testTo = req.body.to;
