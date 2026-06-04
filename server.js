@@ -533,6 +533,54 @@ function contactRateOk(ip) {
   return true;
 }
 
+// Public error-reporting sink. Rate-limited per-IP, payload-truncated.
+// Structured JSON to stdout so Railway log viewer can grep [client-error].
+const ERROR_RATE_WINDOW_MS = 10 * 60 * 1000;
+const ERROR_RATE_MAX = 50;
+const errorRateHits = new Map();
+
+function errorReportRateOk(ip) {
+  const now = Date.now();
+  const recent = (errorRateHits.get(ip) || []).filter((t) => now - t < ERROR_RATE_WINDOW_MS);
+  if (recent.length >= ERROR_RATE_MAX) {
+    errorRateHits.set(ip, recent);
+    return false;
+  }
+  recent.push(now);
+  errorRateHits.set(ip, recent);
+  return true;
+}
+
+app.post('/report-error', async (req, res) => {
+  try {
+    const ipHeader = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
+    const ip = String(ipHeader).split(',')[0].trim() || 'unknown';
+    if (!errorReportRateOk(ip)) return res.status(429).json({ error: 'Rate limited' });
+
+    const message = String(req.body?.message || '').slice(0, 5000);
+    const stack = String(req.body?.stack || '').slice(0, 10000);
+    const url = String(req.body?.url || '').slice(0, 500);
+    const userAgent = String(req.body?.userAgent || req.headers['user-agent'] || '').slice(0, 500);
+    const context = String(req.body?.context || '').slice(0, 500);
+
+    if (!message) return res.status(400).json({ error: 'message is required' });
+
+    console.error('[client-error]', JSON.stringify({
+      ts: new Date().toISOString(),
+      ip,
+      url,
+      userAgent,
+      context,
+      message,
+      stack,
+    }));
+
+    res.json({ received: true });
+  } catch (err) {
+    safeError(res, 'report-error', err, 'Could not log error.');
+  }
+});
+
 app.post('/contact', async (req, res) => {
   try {
     const ipHeader = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'unknown';
