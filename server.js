@@ -661,6 +661,58 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
   }
 });
 
+// Self-healing reconciler. If a SetupIntent succeeded at Stripe but our DB
+// never flipped payment_method_pending=false (webhook delayed, foreground
+// confirm threw a swallowed error, etc.) the dashboard fires this on load
+// to verify against Stripe directly and reconcile the subscription row.
+app.post('/verify-payment-method', requireUser, async (req, res) => {
+  try {
+    const { data: sub } = await supabase
+      .from('subscriptions')
+      .select('stripe_customer_id')
+      .eq('therapist_id', req.authUser.id)
+      .single();
+    if (!sub?.stripe_customer_id) {
+      return res.json({ verified: false, reason: 'no_customer' });
+    }
+
+    const customer = await stripe.customers.retrieve(sub.stripe_customer_id);
+    let defaultPm = customer?.invoice_settings?.default_payment_method;
+
+    // No default set, but a card may still be saved — promote the most
+    // recent one to default so /start-billing can use it later.
+    if (!defaultPm) {
+      const pms = await stripe.paymentMethods.list({
+        customer: sub.stripe_customer_id,
+        type: 'card',
+        limit: 1,
+      });
+      if (pms.data.length > 0) {
+        defaultPm = pms.data[0].id;
+        await stripe.customers.update(sub.stripe_customer_id, {
+          invoice_settings: { default_payment_method: defaultPm },
+        });
+      }
+    }
+
+    if (defaultPm) {
+      await supabase
+        .from('subscriptions')
+        .update({
+          payment_method_pending: false,
+          status: 'active',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('therapist_id', req.authUser.id);
+      return res.json({ verified: true });
+    }
+    return res.json({ verified: false, reason: 'no_payment_method' });
+  } catch (err) {
+    console.error('verify-payment-method:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Each plan family has a founder phase (first 3 months) and a standard
 // phase (every month after that). startBillingForTherapist installs a
 // Stripe subscription_schedule that auto-transitions between them.
