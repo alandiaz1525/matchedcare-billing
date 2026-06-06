@@ -37,8 +37,11 @@ async function requireUser(req, res, next) {
 
 async function requireAdmin(req, res, next) {
   await requireUser(req, res, async () => {
-    const metadataRole = req.authUser.app_metadata?.role || req.authUser.user_metadata?.role;
-    if (metadataRole === 'admin') return next();
+    // Admin authority comes ONLY from app_metadata.role (service-role-set, not
+    // user-editable). Never trust user_metadata.role — a user can set it on
+    // themselves via the auth API and self-promote. The profiles.role DB check
+    // below is the secondary source (guard it with RLS so users can't write it).
+    if (req.authUser.app_metadata?.role === 'admin') return next();
 
     const { data } = await supabase
       .from('profiles')
@@ -729,6 +732,12 @@ app.post('/create-setup-intent', rateLimit(setupIntentLimiter), requireUser, asy
     if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
 
     const safePlanType = plan_type || 'provider_founder';
+    // Reject unknown plans up front rather than persisting an invalid string
+    // that only blows up later at /start-billing. The body is untrusted — this
+    // is an allowlist, not full entitlement enforcement (see provider_count note).
+    if (!PLAN_PRICES[safePlanType]) {
+      return res.status(400).json({ error: `Unknown plan_type: ${safePlanType}` });
+    }
     const safeProviderCount = Math.max(1, Number(provider_count) || 1);
 
     // 1. Find or create the Stripe Customer for this user.
