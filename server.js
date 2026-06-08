@@ -726,19 +726,19 @@ app.post('/test-sms', requireAdmin, async (req, res) => {
 
 app.post('/create-setup-intent', rateLimit(setupIntentLimiter), requireUser, async (req, res) => {
   try {
-    const { plan_type, provider_count } = req.body;
     const user_id = req.authUser.id;
     const email = req.authUser.email;
     if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
 
-    const safePlanType = plan_type || 'provider_founder';
-    // Reject unknown plans up front rather than persisting an invalid string
-    // that only blows up later at /start-billing. The body is untrusted — this
-    // is an allowlist, not full entitlement enforcement (see provider_count note).
+    // Derive the plan and billable provider count from authoritative records
+    // (the owner's clinic + its clinic_staff), NOT the request body — otherwise
+    // a clinic could understate headcount or self-select a cheaper plan to
+    // underpay. The client-sent plan_type/provider_count are ignored for pricing.
+    const { plan_type: safePlanType, provider_count: safeProviderCount } =
+      await resolveBillingPlan(user_id);
     if (!PLAN_PRICES[safePlanType]) {
       return res.status(400).json({ error: `Unknown plan_type: ${safePlanType}` });
     }
-    const safeProviderCount = Math.max(1, Number(provider_count) || 1);
 
     // 1. Find or create the Stripe Customer for this user.
     let customer;
@@ -907,10 +907,37 @@ function buildPhaseItems(phase, providerCount) {
   return items;
 }
 
-async function startBillingForTherapist({ therapist_id, plan_type, provider_count }) {
+// Resolve a user's billing plan + billable provider count from authoritative
+// data, never from client input. A clinic owner's plan follows their clinic
+// type, and their headcount is the number of therapist staff they registered;
+// a user with no clinic is a solo provider. Used at BOTH card-setup time and
+// charge time so the two can never diverge from what the client claimed.
+async function resolveBillingPlan(user_id) {
+  const { data: clinics } = await supabase
+    .from('clinics')
+    .select('id, clinic_type')
+    .eq('owner_id', user_id)
+    .limit(1);
+  const clinic = clinics && clinics[0];
+
+  if (!clinic) return { plan_type: 'provider_founder', provider_count: 1 };
+  if (clinic.clinic_type === 'aba') return { plan_type: 'aba_founder', provider_count: 1 };
+  if (clinic.clinic_type === 'mh_group') {
+    const { data: staff } = await supabase
+      .from('clinic_staff')
+      .select('id')
+      .eq('clinic_id', clinic.id)
+      .eq('staff_role', 'therapist');
+    return { plan_type: 'mh_group_founder', provider_count: Math.max(1, (staff || []).length) };
+  }
+  // Unknown/unsupported clinic_type: safest billable default.
+  return { plan_type: 'provider_founder', provider_count: 1 };
+}
+
+async function startBillingForTherapist({ therapist_id }) {
   const { data: sub, error: subErr } = await supabase
     .from('subscriptions')
-    .select('stripe_customer_id, stripe_subscription_id, provider_count')
+    .select('stripe_customer_id, stripe_subscription_id')
     .eq('therapist_id', therapist_id)
     .single();
   if (subErr || !sub) throw new Error(`Subscription not found for therapist ${therapist_id}`);
@@ -919,6 +946,9 @@ async function startBillingForTherapist({ therapist_id, plan_type, provider_coun
   }
   if (!sub.stripe_customer_id) throw new Error('No stripe_customer_id on subscription record');
 
+  // Re-derive plan + headcount authoritatively at charge time so a stale or
+  // previously client-influenced subscriptions row can't cause underbilling.
+  const { plan_type, provider_count } = await resolveBillingPlan(therapist_id);
   const plan = PLAN_PRICES[plan_type];
   if (!plan) throw new Error(`Unknown plan_type: ${plan_type}`);
 
@@ -926,7 +956,7 @@ async function startBillingForTherapist({ therapist_id, plan_type, provider_coun
   const defaultPm = customer?.invoice_settings?.default_payment_method;
   if (!defaultPm) throw new Error('Customer has no default payment method saved');
 
-  const qty = provider_count ?? sub.provider_count;
+  const qty = provider_count;
 
   try {
     // Two-phase schedule: 3 months at founder pricing, then standard forever.
@@ -964,6 +994,8 @@ async function startBillingForTherapist({ therapist_id, plan_type, provider_coun
       .from('subscriptions')
       .update({
         stripe_subscription_id: subscriptionId,
+        plan_type,
+        provider_count: qty,
         billing_started_at: new Date().toISOString(),
         founder_ends_at: founderEndsAt,
         status,
