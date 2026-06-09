@@ -37,20 +37,14 @@ async function requireUser(req, res, next) {
 
 async function requireAdmin(req, res, next) {
   await requireUser(req, res, async () => {
-    // Admin authority comes ONLY from app_metadata.role (service-role-set, not
-    // user-editable). Never trust user_metadata.role — a user can set it on
-    // themselves via the auth API and self-promote. The profiles.role DB check
-    // below is the secondary source (guard it with RLS so users can't write it).
+    // Admin authority comes ONLY from app_metadata.role — it is service-role-set
+    // and not user-editable. Never trust user_metadata.role (settable by the user
+    // via the auth API) NOR profiles.role: the profiles RLS UPDATE policy is
+    // scoped only to `user_id = auth.uid()` with no column restriction, so any
+    // authenticated user can PATCH their own profiles.role = 'admin' with the
+    // public anon key and self-promote. app_metadata is the single source of truth.
     if (req.authUser.app_metadata?.role === 'admin') return next();
-
-    const { data } = await supabase
-      .from('profiles')
-      .select('role')
-      .eq('user_id', req.authUser.id)
-      .single();
-
-    if (data?.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
-    next();
+    return res.status(403).json({ error: 'Admin access required' });
   });
 }
 
