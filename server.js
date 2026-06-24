@@ -11,6 +11,12 @@ const PORT = process.env.PORT || 3001;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 const resend = new Resend(process.env.RESEND_API_KEY);
 const FROM_EMAIL = process.env.FROM_EMAIL || 'MatchedCare <notifications@matchedcare.us>';
+
+// Early-access FREE MODE. While ON, no subscription is ever started/charged and
+// transactional emails say the platform is free. Mirrors VITE_FREE_MODE on the
+// frontend. Flip OFF (set FREE_MODE=false on Railway) to resume billing.
+// Defaults ON (current launch strategy) when unset.
+const FREE_MODE = !['false', '0', 'off', 'no'].includes(String(process.env.FREE_MODE ?? 'true').toLowerCase());
 const ALLOWED_RETURN_ORIGINS = new Set([
   'https://matchedcare.us',
   'https://www.matchedcare.us',
@@ -442,7 +448,7 @@ function providerMatchEmail({ providerName, clientName, clientEmail, matchScore,
     ${concerns && concerns.length > 0 ? `<div class="info-box"><p class="info-label">Primary Concerns</p><p style="font-size:14px;color:#2C3038;margin:4px 0 0">${escapeHtml(concerns.join(', '))}</p></div>` : ''}
     ${explanation ? `<div class="highlight"><p><strong>Why you were matched:</strong> ${escapeHtml(explanation)}</p></div>` : ''}
     ${email ? `<div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
-    ${referralCount !== undefined ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">This is referral #${escapeHtml(referralCount)}${referralCount < 5 ? ' of your 5 free referrals.' : '. Billing is now active.'}</p>` : ''}
+    ${FREE_MODE ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">MatchedCare is free during early access — there's no charge for this or any referral right now.</p>` : (referralCount !== undefined ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">This is referral #${escapeHtml(referralCount)}${referralCount < 5 ? ' of your 5 free referrals.' : '. Billing is now active.'}</p>` : '')}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard</a></div>`);
 }
 
@@ -462,7 +468,17 @@ function clinicMatchEmail({ clinicName, clientName, clientEmail, serviceType, ma
 }
 
 function welcomeEmail({ name, role }) {
-  const msgs = { client: "We're here to help you find a provider who truly fits.", therapist: "Complete your profile and you'll start receiving matched client referrals. Your first 5 referrals are free.", clinic: "Once activated, you'll start receiving matched client referrals automatically." };
+  const msgs = FREE_MODE
+    ? {
+        client: "We're here to help you find a provider who truly fits.",
+        therapist: "Complete your profile and you'll start receiving matched client referrals. MatchedCare is free for providers during early access — no payment method required.",
+        clinic: "Once verified, you'll start receiving matched client referrals automatically. MatchedCare is free for clinics during early access — no payment method required.",
+      }
+    : {
+        client: "We're here to help you find a provider who truly fits.",
+        therapist: "Complete your profile and you'll start receiving matched client referrals. Your first 3 referrals are free.",
+        clinic: "Once activated, you'll start receiving matched client referrals automatically.",
+      };
   return emailWrapper(`<h1>Welcome to MatchedCare</h1><p class="subtitle">${escapeHtml(name)}, your account has been created.</p><p style="font-size:14px;color:#6E7178;line-height:1.7">${escapeHtml(msgs[role] || msgs.client)}</p><div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Get Started</a></div>`);
 }
 
@@ -1025,6 +1041,8 @@ function requireCronToken(req, res, next) {
 
 // Shared runner used by both /check-billing and the internal interval cron.
 async function runBillingCheck() {
+  // Free early access: never start/charge any subscription.
+  if (FREE_MODE) return { checked: 0, results: [], free_mode: true };
   const { data: rows, error } = await supabase
     .from('subscriptions')
     .select('therapist_id, plan_type, provider_count')
@@ -1050,6 +1068,8 @@ async function runBillingCheck() {
 
 app.post('/start-billing', requireCronToken, async (req, res) => {
   try {
+    // Free early access: refuse to start billing regardless of caller.
+    if (FREE_MODE) return res.json({ skipped: true, free_mode: true });
     const { therapist_id, plan_type, provider_count } = req.body;
     if (!therapist_id || !plan_type) {
       return res.status(400).json({ error: 'therapist_id and plan_type are required' });
@@ -1117,4 +1137,5 @@ app.listen(PORT, () => {
   console.log(`Email: ${process.env.RESEND_API_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`SMS: ${twilioClient ? 'ENABLED' : 'DISABLED'}`);
   console.log(`Billing cron: interval=${BILLING_CRON_MS / 1000}s`);
+  console.log(`FREE MODE: ${FREE_MODE ? 'ON (no charges; free for everyone)' : 'OFF (paid plans active)'}`);
 });
