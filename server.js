@@ -157,7 +157,11 @@ async function sendSMS(to, message) {
     else return false;
   }
   try {
-    await twilioClient.messages.create({ body: message, from: TWILIO_PHONE, to: phone });
+    // TCPA compliance: ensure every outgoing SMS carries an opt-out notice.
+    // Appended centrally so no caller can forget it; skipped only if the
+    // message already references STOP.
+    const body = /\bstop\b/i.test(message) ? message : `${message} Reply STOP to opt out.`;
+    await twilioClient.messages.create({ body, from: TWILIO_PHONE, to: phone });
     console.log('SMS sent to:', phone.replace(/(\+?\d{1,3})\d+(\d{4})/, '$1***$2'));
     return true;
   } catch (err) {
