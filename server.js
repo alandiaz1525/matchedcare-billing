@@ -486,6 +486,61 @@ function welcomeEmail({ name, role }) {
   return emailWrapper(`<h1>Welcome to MatchedCare</h1><p class="subtitle">${escapeHtml(name)}, your account has been created.</p><p style="font-size:14px;color:#6E7178;line-height:1.7">${escapeHtml(msgs[role] || msgs.client)}</p><div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Get Started</a></div>`);
 }
 
+// ── Warm-handoff templates ──────────────────────────────────────────────────
+// Alert to the THERAPIST when a new match is pending their review.
+function therapistMatchAlertEmail({ providerName, clientFirstName, concern, insurance, schedule, matchScore }) {
+  return emailWrapper(`
+    <h1>New client match</h1>
+    <p class="subtitle">${escapeHtml(providerName || 'there')}, a new client has been matched to you and is waiting for your review.</p>
+    <div class="info-box"><p class="info-label">Client</p><p class="info-value">${escapeHtml(clientFirstName || 'New client')}</p>
+    ${matchScore ? `<p style="margin:8px 0 0"><span class="score">${Math.round(matchScore)}% compatibility</span></p>` : ''}</div>
+    ${concern ? `<div class="info-box"><p class="info-label">Primary concern</p><p class="info-value">${escapeHtml(concern)}</p></div>` : ''}
+    ${insurance ? `<div class="info-box"><p class="info-label">Insurance</p><p class="info-value">${escapeHtml(insurance)}</p></div>` : ''}
+    ${schedule ? `<div class="info-box"><p class="info-label">Preferred schedule</p><p class="info-value">${escapeHtml(schedule)}</p></div>` : ''}
+    <p style="font-size:14px;color:#6E7178;line-height:1.6">Review this match and accept to see full client details and connect.</p>
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Review Match</a></div>`);
+}
+
+// Avatar block for emails: photo if present, else an initials circle.
+function emailAvatar(name, photoUrl) {
+  const initials = String(name || '').trim().split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0] ? w[0].toUpperCase() : '').join('') || '?';
+  if (photoUrl) return `<img src="${escapeHtml(photoUrl)}" width="72" height="72" alt="" style="width:72px;height:72px;border-radius:50%;object-fit:cover;border:3px solid #ECF2F6" />`;
+  return `<div style="width:72px;height:72px;border-radius:50%;background:#4A7C9B;color:#fff;font-size:26px;font-weight:600;line-height:72px;text-align:center;font-family:'Helvetica Neue',Arial,sans-serif">${escapeHtml(initials)}</div>`;
+}
+
+// Notify the CLIENT that the therapist accepted.
+function clientAcceptedEmail({ clientName, providerName, credentials, providerType, headline, specialties, photoUrl, contactEmail }) {
+  const email = safeEmail(contactEmail);
+  return emailWrapper(`
+    <h1>Great news — we found your therapist!</h1>
+    <p class="subtitle">${escapeHtml(clientName || 'there')}, ${escapeHtml(providerName || 'your therapist')} has accepted your match and is ready to connect.</p>
+    <div style="text-align:center;margin:8px 0 20px">${emailAvatar(providerName, photoUrl)}
+      <p style="font-size:18px;color:#1A242E;font-weight:600;margin:12px 0 2px">${escapeHtml(providerName || 'Your therapist')}</p>
+      ${(credentials || providerType) ? `<p style="font-size:13px;color:#6E7178;margin:0">${escapeHtml([credentials, providerType].filter(Boolean).join(' · '))}</p>` : ''}
+    </div>
+    ${headline ? `<div class="highlight"><p>${escapeHtml(headline)}</p></div>` : ''}
+    ${specialties && specialties.length ? `<div class="info-box"><p class="info-label">Specialties</p><p class="info-value">${escapeHtml(specialties.join(', '))}</p></div>` : ''}
+    ${email ? `<div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View Your Therapist's Profile</a></div>`);
+}
+
+// Follow-up nudges (3-day / 7-day) to either party.
+function followupEmail({ toName, otherName, contactEmail, role, stage }) {
+  const email = safeEmail(contactEmail);
+  const finalNudge = stage >= 2;
+  const headline = role === 'therapist'
+    ? `Have you connected with ${escapeHtml(otherName || 'your client')}?`
+    : `Have you reached out to ${escapeHtml(otherName || 'your therapist')}?`;
+  const body = role === 'therapist'
+    ? `Just checking in on your recent match. Let us know if you need anything${finalNudge ? ", or we can find your client another provider if this isn't a fit." : '.'}`
+    : `Your therapist is expecting to hear from you. ${email ? "Their contact info is below." : 'Open your dashboard for their contact info.'}${finalNudge ? " If it's not the right fit, you can request a new match." : ''}`;
+  return emailWrapper(`
+    <h1>${headline}</h1>
+    <p class="subtitle">${escapeHtml(toName || 'there')}, ${escapeHtml(body)}</p>
+    ${(role !== 'therapist' && email) ? `<div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
+    <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Open Dashboard</a></div>`);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTIFICATION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -573,6 +628,82 @@ app.post('/notify-match', rateLimit(notifyMatchLimiter), requireUser, async (req
     }
   } catch (err) {
     safeError(res, 'notify-match', err, 'Could not send notifications.');
+  }
+});
+
+// Warm handoff: alert the matched THERAPIST about a new pending match (review needed).
+app.post('/notify-therapist-match', rateLimit(notifyMatchLimiter), requireUser, async (req, res) => {
+  try {
+    const { match_id } = req.body;
+    if (!match_id) return res.status(400).json({ error: 'match_id is required' });
+    const { data: match } = await supabase.from('matches').select('*').eq('id', match_id).single();
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    if (req.authUser.id !== match.client_id) return res.status(403).json({ error: 'Forbidden' });
+
+    const { data: clientProfile } = await supabase.from('profiles').select('full_name').eq('user_id', match.client_id).single();
+    const { data: providerProfile } = await supabase.from('profiles').select('full_name, email, phone').eq('user_id', match.therapist_id).single();
+    const { data: therapist } = await supabase.from('therapists').select('phone, display_name').eq('user_id', match.therapist_id).single();
+    const { data: client } = await supabase.from('clients').select('insurance_provider, preferred_days, preferred_times').eq('user_id', match.client_id).single();
+    const { data: summary } = await supabase.from('client_summaries').select('primary_concerns').eq('client_id', match.client_id).single();
+
+    const firstName = (clientProfile?.full_name || '').trim().split(/\s+/)[0] || 'New client';
+    const concern = summary?.primary_concerns?.length ? summary.primary_concerns.join(', ') : null;
+    const schedule = [(client?.preferred_days || []).join('/'), (client?.preferred_times || []).join('/')].filter(Boolean).join(' · ') || null;
+    const providerName = therapist?.display_name || providerProfile?.full_name || 'there';
+
+    let emailsSent = 0, smsSent = 0;
+    if (providerProfile?.email) {
+      await resend.emails.send({ from: FROM_EMAIL, to: providerProfile.email, subject: 'New client match on MatchedCare', html: therapistMatchAlertEmail({ providerName, clientFirstName: firstName, concern, insurance: client?.insurance_provider || null, schedule, matchScore: match.composite_score }) });
+      emailsSent++;
+    }
+    const providerPhone = therapist?.phone || providerProfile?.phone;
+    if (providerPhone) {
+      const sent = await sendSMS(providerPhone, `MatchedCare: New client match! ${firstName}${concern ? ', ' + concern : ''}${client?.insurance_provider ? ', ' + client.insurance_provider : ''}. Log in to review: matchedcare.us`);
+      if (sent) smsSent++;
+    }
+    await supabase.from('matches').update({ match_status: 'notified', therapist_notified_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', match_id);
+    res.json({ success: true, emails_sent: emailsSent, sms_sent: smsSent });
+  } catch (err) {
+    safeError(res, 'notify-therapist-match', err, 'Could not notify the therapist.');
+  }
+});
+
+// Warm handoff: notify the CLIENT that the therapist accepted the match.
+app.post('/notify-client-accepted', rateLimit(notifyMatchLimiter), requireUser, async (req, res) => {
+  try {
+    const { match_id } = req.body;
+    if (!match_id) return res.status(400).json({ error: 'match_id is required' });
+    const { data: match } = await supabase.from('matches').select('*').eq('id', match_id).single();
+    if (!match) return res.status(404).json({ error: 'Match not found' });
+    if (req.authUser.id !== match.therapist_id) return res.status(403).json({ error: 'Forbidden' });
+
+    const { data: clientProfile } = await supabase.from('profiles').select('full_name, email').eq('user_id', match.client_id).single();
+    const { data: providerProfile } = await supabase.from('profiles').select('full_name, email').eq('user_id', match.therapist_id).single();
+    const { data: therapist } = await supabase.from('therapists').select('display_name, professional_headline, credentials, provider_type, profile_photo_url').eq('user_id', match.therapist_id).single();
+    let specialties = [];
+    try {
+      const { data: specs } = await supabase.from('therapist_specialties').select('condition_id').eq('therapist_id', match.therapist_id);
+      const ids = (specs || []).map(s => s.condition_id).filter(x => x != null);
+      if (ids.length) { const { data: conds } = await supabase.from('conditions').select('id,label').in('id', ids); const m = Object.fromEntries((conds || []).map(c => [c.id, c.label])); specialties = ids.map(i => m[i]).filter(Boolean); }
+    } catch {}
+
+    const clientName = (clientProfile?.full_name || '').trim().split(/\s+/)[0] || 'there';
+    const providerName = therapist?.display_name || providerProfile?.full_name || 'your therapist';
+
+    let emailsSent = 0, smsSent = 0;
+    if (clientProfile?.email) {
+      await resend.emails.send({ from: FROM_EMAIL, to: clientProfile.email, subject: 'Great news — we found your therapist!', html: clientAcceptedEmail({ clientName, providerName, credentials: therapist?.credentials, providerType: therapist?.provider_type, headline: therapist?.professional_headline, specialties, photoUrl: therapist?.profile_photo_url, contactEmail: providerProfile?.email }) });
+      emailsSent++;
+    }
+    const clientPhone = await userOptedInSMS(match.client_id);
+    if (clientPhone) {
+      const sent = await sendSMS(clientPhone, `MatchedCare: You've been matched with ${providerName}! Check your email for details.`);
+      if (sent) smsSent++;
+    }
+    await supabase.from('matches').update({ connected_at: new Date().toISOString(), updated_at: new Date().toISOString() }).eq('id', match_id);
+    res.json({ success: true, emails_sent: emailsSent, sms_sent: smsSent });
+  } catch (err) {
+    safeError(res, 'notify-client-accepted', err, 'Could not notify the client.');
   }
 });
 
@@ -1135,6 +1266,42 @@ async function runBillingCronTick() {
   }
 }
 setInterval(runBillingCronTick, BILLING_CRON_MS);
+
+// Warm-handoff follow-up cron (hourly). For accepted-but-not-booked matches,
+// sends a 3-day nudge then a 7-day final nudge to both parties (email only).
+// followup_count guards against duplicates; booked matches are skipped.
+const FOLLOWUP_CRON_MS = 60 * 60 * 1000;
+async function runFollowupTick() {
+  try {
+    const now = Date.now();
+    const { data: rows, error } = await supabase.from('matches')
+      .select('id, client_id, therapist_id, therapist_responded_at, followup_count, booked_at')
+      .eq('match_status', 'accepted')
+      .lt('followup_count', 2);
+    if (error) throw error;
+    for (const m of rows || []) {
+      if (m.booked_at || !m.therapist_responded_at) continue;
+      const ageDays = (now - new Date(m.therapist_responded_at).getTime()) / 86400000;
+      const stage = m.followup_count || 0;
+      const due = (stage === 0 && ageDays >= 3) || (stage === 1 && ageDays >= 7);
+      if (!due) continue;
+      const nextStage = stage + 1;
+      const { data: cp } = await supabase.from('profiles').select('full_name, email').eq('user_id', m.client_id).single();
+      const { data: pp } = await supabase.from('profiles').select('full_name, email').eq('user_id', m.therapist_id).single();
+      const { data: th } = await supabase.from('therapists').select('display_name').eq('user_id', m.therapist_id).single();
+      const clientName = (cp?.full_name || '').trim().split(/\s+/)[0] || 'there';
+      const providerName = th?.display_name || pp?.full_name || 'your therapist';
+      try {
+        if (pp?.email) await resend.emails.send({ from: FROM_EMAIL, to: pp.email, subject: nextStage >= 2 ? 'Checking in on your MatchedCare match' : 'Have you connected with your client?', html: followupEmail({ toName: providerName, otherName: clientName, contactEmail: cp?.email, role: 'therapist', stage: nextStage }) });
+        if (cp?.email) await resend.emails.send({ from: FROM_EMAIL, to: cp.email, subject: nextStage >= 2 ? 'Still here to help with your match' : 'Have you reached out to your therapist?', html: followupEmail({ toName: clientName, otherName: providerName, contactEmail: pp?.email, role: 'client', stage: nextStage }) });
+      } catch (e) { console.error('followup email error:', e.message); }
+      await supabase.from('matches').update({ followup_count: nextStage, last_followup_at: new Date().toISOString() }).eq('id', m.id);
+    }
+  } catch (err) {
+    console.error('followup cron error:', err.message);
+  }
+}
+setInterval(runFollowupTick, FOLLOWUP_CRON_MS);
 
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
