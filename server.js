@@ -541,6 +541,17 @@ function followupEmail({ toName, otherName, contactEmail, role, stage }) {
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Open Dashboard</a></div>`);
 }
 
+// Gentle nudge to a provider who hasn't finished their profile yet.
+function profileReminderEmail({ name }) {
+  return emailWrapper(`
+    <h1>You're almost there</h1>
+    <p class="subtitle">${escapeHtml(name || 'there')}, your MatchedCare profile is almost ready — there are just a few details left to add.</p>
+    <p style="font-size:14px;color:#6E7178;line-height:1.7">Until your profile is complete, we can't match you with clients who are looking for a provider like you. The good news: finishing is <strong>free</strong> and takes about <strong>10 minutes</strong> — just your credentials, license, and a short bio.</p>
+    <div class="highlight"><p>Complete your profile and you'll start receiving matched client referrals.</p></div>
+    <div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Complete My Profile</a></div>
+    <p style="font-size:12px;color:#9A9DA4;margin-top:20px">You're receiving this because you started a MatchedCare provider account. Reply STOP to opt out.</p>`);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // NOTIFICATION ENDPOINTS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1225,6 +1236,72 @@ app.get('/check-billing', requireCronToken, async (req, res) => {
   }
 });
 
+// Profile-completion reminders. Finds providers who signed up but haven't
+// finished their profile (missing credentials/license/npi), aged 1h–7d, with
+// fewer than 3 reminders sent, and emails a gentle nudge. Idempotent: skips
+// anyone reminded within the last 24h. Consent: only providers who opted into
+// notifications (profiles.sms_consent) — flip CONSENT_REQUIRED to treat the
+// reminder as transactional and email all incomplete providers instead.
+const REMINDER_MAX = 3;
+const REMINDER_MIN_AGE_MS = 60 * 60 * 1000;          // 1 hour
+const REMINDER_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const REMINDER_COOLDOWN_MS = 24 * 60 * 60 * 1000;    // 1 day between emails
+const REMINDER_CONSENT_REQUIRED = false;
+async function runIncompleteProfileCheck() {
+  const now = Date.now();
+  const minAge = new Date(now - REMINDER_MIN_AGE_MS).toISOString();
+  const maxAge = new Date(now - REMINDER_MAX_AGE_MS).toISOString();
+  const { data: rows, error } = await supabase
+    .from('therapists')
+    .select('user_id, credentials, license_type, npi, created_at, reminder_sent_count, last_reminder_at')
+    .or('credentials.is.null,license_type.is.null,npi.is.null')
+    .lt('created_at', minAge)
+    .gt('created_at', maxAge)
+    .lt('reminder_sent_count', REMINDER_MAX);
+  if (error) throw error;
+
+  let emailsSent = 0;
+  const errors = [];
+  for (const t of rows || []) {
+    try {
+      // Idempotency: don't email the same provider twice within 24h.
+      if (t.last_reminder_at && (now - new Date(t.last_reminder_at).getTime()) < REMINDER_COOLDOWN_MS) continue;
+
+      const { data: prof } = await supabase.from('profiles').select('sms_consent, full_name').eq('user_id', t.user_id).single();
+      if (REMINDER_CONSENT_REQUIRED && !prof?.sms_consent) continue;
+
+      // Email lives in auth.users — look it up with the service role.
+      const { data: au, error: auErr } = await supabase.auth.admin.getUserById(t.user_id);
+      const email = au?.user?.email;
+      if (auErr || !email) { errors.push({ user_id: t.user_id, error: auErr?.message || 'no email found' }); continue; }
+
+      await resend.emails.send({
+        from: FROM_EMAIL,
+        to: email,
+        subject: "You're almost there — complete your MatchedCare profile",
+        html: profileReminderEmail({ name: prof?.full_name }),
+      });
+      await supabase.from('therapists').update({
+        reminder_sent_count: (t.reminder_sent_count || 0) + 1,
+        last_reminder_at: new Date().toISOString(),
+      }).eq('user_id', t.user_id);
+      emailsSent++;
+    } catch (e) {
+      errors.push({ user_id: t.user_id, error: e?.message || String(e) });
+    }
+  }
+  return { incomplete_found: (rows || []).length, emails_sent: emailsSent, errors };
+}
+
+app.get('/check-incomplete-profiles', requireCronToken, async (req, res) => {
+  try {
+    const result = await runIncompleteProfileCheck();
+    res.json(result);
+  } catch (err) {
+    safeError(res, 'check-incomplete-profiles', err, 'Incomplete-profile check failed.');
+  }
+});
+
 // /create-portal-session deliberately ignores any customer id from the
 // client. The customer is looked up from the authed user's subscription row
 // to prevent a leaked or guessed stripe_customer_id from opening another
@@ -1302,6 +1379,14 @@ async function runFollowupTick() {
   }
 }
 setInterval(runFollowupTick, FOLLOWUP_CRON_MS);
+
+// Daily profile-completion reminder sweep (same logic as GET /check-incomplete-profiles).
+const REMINDER_CRON_MS = 24 * 60 * 60 * 1000;
+setInterval(() => {
+  runIncompleteProfileCheck()
+    .then((r) => { if (r.emails_sent > 0) console.log(`profile reminders: sent ${r.emails_sent} of ${r.incomplete_found} incomplete`); })
+    .catch((err) => console.error('profile-reminder cron error:', err.message));
+}, REMINDER_CRON_MS);
 
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
