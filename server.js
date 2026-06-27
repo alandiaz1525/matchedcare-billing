@@ -1380,13 +1380,9 @@ async function runFollowupTick() {
 }
 setInterval(runFollowupTick, FOLLOWUP_CRON_MS);
 
-// Daily profile-completion reminder sweep (same logic as GET /check-incomplete-profiles).
-const REMINDER_CRON_MS = 24 * 60 * 60 * 1000;
-setInterval(() => {
-  runIncompleteProfileCheck()
-    .then((r) => { if (r.emails_sent > 0) console.log(`profile reminders: sent ${r.emails_sent} of ${r.incomplete_found} incomplete`); })
-    .catch((err) => console.error('profile-reminder cron error:', err.message));
-}, REMINDER_CRON_MS);
+// Profile-completion reminders are scheduled by the separate Railway cron service
+// (cron-reminders.js -> GET /check-incomplete-profiles), so there is no in-process
+// interval here — that keeps a single source of truth for the daily sweep.
 
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
