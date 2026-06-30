@@ -969,12 +969,18 @@ app.post('/confirm-setup-intent', requireUser, async (req, res) => {
       });
     }
 
+    // Saving a payment method IS the provider's voluntary opt-in to billing.
+    // Stamp billing_opt_in + the account's pricing cohort here so the cohort is
+    // pinned at opt-in time, not re-derived later when the switch state differs.
+    const cohort = await resolveCohort(req.authUser.id);
     await supabase
       .from('subscriptions')
       .update({
         payment_method_pending: false,
         stripe_customer_id: si.customer,
         status: 'active',
+        billing_opt_in: true,
+        cohort,
         updated_at: new Date().toISOString(),
       })
       .eq('therapist_id', req.authUser.id);
@@ -1020,11 +1026,17 @@ app.post('/verify-payment-method', requireUser, async (req, res) => {
     }
 
     if (defaultPm) {
+      // A saved default card is a confirmed voluntary opt-in (see
+      // /confirm-setup-intent). Mirror the opt-in + cohort stamp here so a
+      // delayed/missed confirm still records the provider's billing consent.
+      const cohort = await resolveCohort(req.authUser.id);
       await supabase
         .from('subscriptions')
         .update({
           payment_method_pending: false,
           status: 'active',
+          billing_opt_in: true,
+          cohort,
           updated_at: new Date().toISOString(),
         })
         .eq('therapist_id', req.authUser.id);
@@ -1090,10 +1102,25 @@ async function resolveBillingPlan(user_id) {
   return { plan_type: 'provider_founder', provider_count: 1 };
 }
 
+// Resolve the account's pricing cohort. 'founder' = grandfathered (joined while
+// the platform was free) and keeps the founder->standard schedule. 'standard' =
+// joined after monetization went live and starts at standard pricing with no
+// founder discount. Defaults to the cheaper-for-the-user 'founder' if unknown.
+async function resolveCohort(user_id) {
+  try {
+    const { data, error } = await supabase.rpc('account_cohort', { p_uid: user_id });
+    if (error) throw error;
+    return data === 'standard' ? 'standard' : 'founder';
+  } catch (e) {
+    console.warn('resolveCohort failed, defaulting to founder:', e.message);
+    return 'founder';
+  }
+}
+
 async function startBillingForTherapist({ therapist_id }) {
   const { data: sub, error: subErr } = await supabase
     .from('subscriptions')
-    .select('stripe_customer_id, stripe_subscription_id')
+    .select('stripe_customer_id, stripe_subscription_id, cohort, billing_opt_in')
     .eq('therapist_id', therapist_id)
     .single();
   if (subErr || !sub) throw new Error(`Subscription not found for therapist ${therapist_id}`);
@@ -1101,6 +1128,15 @@ async function startBillingForTherapist({ therapist_id }) {
     return { already_active: true, subscription_id: sub.stripe_subscription_id };
   }
   if (!sub.stripe_customer_id) throw new Error('No stripe_customer_id on subscription record');
+
+  // INVARIANT 6 (structural): never auto-charge. Billing only proceeds for a
+  // provider who voluntarily opted in (saved a payment method). Flipping the
+  // monetization switch can therefore never charge anyone who hasn't opted in.
+  if (!sub.billing_opt_in) {
+    throw new Error(`Provider ${therapist_id} has not opted into billing; refusing to charge.`);
+  }
+
+  const cohort = sub.cohort || (await resolveCohort(therapist_id));
 
   // Re-derive plan + headcount authoritatively at charge time so a stale or
   // previously client-influenced subscriptions row can't cause underbilling.
@@ -1115,19 +1151,24 @@ async function startBillingForTherapist({ therapist_id }) {
   const qty = provider_count;
 
   try {
-    // Two-phase schedule: 3 months at founder pricing, then standard forever.
-    // end_behavior='release' lets the subscription continue standalone after
-    // the last phase finishes (which never expires).
+    // Founder cohort (grandfathered): 3 months at founder pricing, then standard
+    // forever. Standard cohort (joined after monetization on): standard pricing
+    // from day one — the founder discount is grandfathered to early providers,
+    // never extended to late joiners. end_behavior='release' lets the
+    // subscription continue standalone after the last phase finishes.
+    const phases = cohort === 'standard'
+      ? [{ items: buildPhaseItems(plan.standard, qty) }]
+      : [
+          { items: buildPhaseItems(plan.founder, qty), iterations: 3 },
+          { items: buildPhaseItems(plan.standard, qty) },
+        ];
     const schedule = await stripe.subscriptionSchedules.create({
       customer: sub.stripe_customer_id,
       start_date: 'now',
       end_behavior: 'release',
       default_settings: { default_payment_method: defaultPm },
-      phases: [
-        { items: buildPhaseItems(plan.founder, qty), iterations: 3 },
-        { items: buildPhaseItems(plan.standard, qty) },
-      ],
-      metadata: { therapist_id, plan_type },
+      phases,
+      metadata: { therapist_id, plan_type, cohort },
     });
 
     const subscriptionId = schedule.subscription;
@@ -1141,8 +1182,9 @@ async function startBillingForTherapist({ therapist_id }) {
         console.warn('post-create subscription retrieve failed:', e.message);
       }
     }
-    // Phase[0].end_date is when founder pricing ends (in Unix seconds).
-    if (schedule.phases?.[0]?.end_date) {
+    // Phase[0].end_date is when founder pricing ends (Unix seconds). Only the
+    // founder cohort has a founder phase; standard cohort never gets one.
+    if (cohort !== 'standard' && schedule.phases?.[0]?.end_date) {
       founderEndsAt = new Date(schedule.phases[0].end_date * 1000).toISOString();
     }
 
@@ -1151,6 +1193,7 @@ async function startBillingForTherapist({ therapist_id }) {
       .update({
         stripe_subscription_id: subscriptionId,
         plan_type,
+        cohort,
         provider_count: qty,
         billing_started_at: new Date().toISOString(),
         founder_ends_at: founderEndsAt,
@@ -1189,10 +1232,14 @@ function requireCronToken(req, res, next) {
 async function runBillingCheck() {
   // Free early access: never start/charge any subscription.
   if (FREE_MODE) return { checked: 0, results: [], free_mode: true };
+  // INVARIANT 6 (structural): only ever charge providers who explicitly opted in
+  // (billing_opt_in=true, set when they voluntarily saved a payment method).
+  // Flipping the monetization switch on can never auto-charge a non-opted-in
+  // provider because this is the sole automated billing path.
   const { data: rows, error } = await supabase
     .from('subscriptions')
     .select('therapist_id, plan_type, provider_count')
-    .eq('billing_ready', true)
+    .eq('billing_opt_in', true)
     .is('stripe_subscription_id', null);
   if (error) throw error;
 
