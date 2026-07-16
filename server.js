@@ -720,13 +720,25 @@ app.post('/notify-client-accepted', rateLimit(notifyMatchLimiter), requireUser, 
 
 app.post('/send-welcome', requireUser, async (req, res) => {
   try {
-    const { name, role, phone, smsOptIn } = req.body;
+    const { name, role, phone, smsOptIn, waitlisted, state } = req.body;
     const email = req.authUser.email;
     if (!email) return res.status(400).json({ error: 'Authenticated user email is required' });
-    await resend.emails.send({ from: FROM_EMAIL, to: email, subject: 'Welcome to MatchedCare', html: welcomeEmail({ name: name || 'there', role: role || 'client' }) });
+    // Out-of-state FULL account (provider/clinic created a real profile but is
+    // held until launch): send the "ready for launch day" template instead of
+    // the standard welcome. Auth-gated, so this only ever emails the caller's
+    // own address (no abuse surface).
+    if (waitlisted && (role === 'therapist' || role === 'clinic')) {
+      const stateLabel = US_STATE_NAMES[String(state || '').toUpperCase()] || state || 'your state';
+      await resend.emails.send({ from: FROM_EMAIL, to: email, subject: 'Your MatchedCare profile is ready for launch day', html: providerLaunchReadyEmail({ name: name || 'there', state: stateLabel, audience: role }) });
+    } else {
+      await resend.emails.send({ from: FROM_EMAIL, to: email, subject: 'Welcome to MatchedCare', html: welcomeEmail({ name: name || 'there', role: role || 'client' }) });
+    }
     // Send welcome SMS if opted in
     if (smsOptIn && phone) {
-      await sendSMS(phone, `Welcome to MatchedCare, ${name || 'there'}! We'll text you when you're matched with a provider. View your dashboard: matchedcare.us`);
+      const smsBody = waitlisted
+        ? `Thanks ${name || 'there'}! Your MatchedCare profile is ready. We'll text you the moment we launch in your state.`
+        : `Welcome to MatchedCare, ${name || 'there'}! We'll text you when you're matched with a provider. View your dashboard: matchedcare.us`;
+      await sendSMS(phone, smsBody);
     }
     res.json({ success: true });
   } catch (err) {
@@ -1063,6 +1075,14 @@ const PLAN_PRICES = {
   mh_group_founder: {
     founder: { base: 'price_1TeLZZPtdczvTubYTp7HOgok', perProvider: 'price_1TeLZXPtdczvTubYMmArl1Ds' },
     standard: { base: 'price_1TeLZUPtdczvTubYA2dJQGHF', perProvider: 'price_1TeLZSPtdczvTubYolDwdmEd' },
+  },
+  // TODO(evaluations add-on): no Stripe product exists yet. These are NAMED
+  // PLACEHOLDERS — replace with real Stripe price IDs before the evaluations
+  // add-on is ever billable. Plumbing only: evaluation matching is free during
+  // the founding period, so /start-billing is never invoked for this plan today.
+  evaluations_addon: {
+    founder: { base: 'price_TODO_EVALUATIONS_ADDON_FOUNDER' },
+    standard: { base: 'price_TODO_EVALUATIONS_ADDON_STANDARD' },
   },
 };
 
@@ -1430,6 +1450,187 @@ setInterval(runFollowupTick, FOLLOWUP_CRON_MS);
 // Profile-completion reminders are scheduled by the separate Railway cron service
 // (cron-reminders.js -> GET /check-incomplete-profiles), so there is no in-process
 // interval here — that keeps a single source of truth for the daily sweep.
+
+// ═══════════════════════════════════════════════════════════════════════════
+// OUT-OF-STATE WAITLIST + LAUNCH LEVER
+// ═══════════════════════════════════════════════════════════════════════════
+
+const US_STATE_NAMES = {
+  AL: 'Alabama', AK: 'Alaska', AZ: 'Arizona', AR: 'Arkansas', CA: 'California',
+  CO: 'Colorado', CT: 'Connecticut', DE: 'Delaware', DC: 'Washington, D.C.',
+  FL: 'Florida', GA: 'Georgia', HI: 'Hawaii', ID: 'Idaho', IL: 'Illinois',
+  IN: 'Indiana', IA: 'Iowa', KS: 'Kansas', KY: 'Kentucky', LA: 'Louisiana',
+  ME: 'Maine', MD: 'Maryland', MA: 'Massachusetts', MI: 'Michigan',
+  MN: 'Minnesota', MS: 'Mississippi', MO: 'Missouri', MT: 'Montana',
+  NE: 'Nebraska', NV: 'Nevada', NH: 'New Hampshire', NJ: 'New Jersey',
+  NM: 'New Mexico', NY: 'New York', NC: 'North Carolina', ND: 'North Dakota',
+  OH: 'Ohio', OK: 'Oklahoma', OR: 'Oregon', PA: 'Pennsylvania', PR: 'Puerto Rico',
+  RI: 'Rhode Island', SC: 'South Carolina', SD: 'South Dakota', TN: 'Tennessee',
+  TX: 'Texas', UT: 'Utah', VT: 'Vermont', VA: 'Virginia', WA: 'Washington',
+  WV: 'West Virginia', WI: 'Wisconsin', WY: 'Wyoming',
+};
+
+// Shared care off-ramp for patients — never let someone in need leave empty-handed.
+function careResourcesHtml() {
+  return `<div class="info-box"><p class="info-label">Need care now? Don't wait for us.</p>
+    <p style="font-size:14px;color:#2C3038;line-height:1.8;margin:6px 0 0">
+    &middot; <a href="https://findtreatment.gov" style="color:#4A7C9B;text-decoration:none">findtreatment.gov</a> — find treatment options near you<br>
+    &middot; Call <strong>211</strong> for local health and social services<br>
+    &middot; Your insurance company can provide a list of in-network therapists</p></div>`;
+}
+
+function optOutLine() {
+  return `<p style="font-size:12px;color:#9A9DA4;margin-top:20px">You're receiving this because you joined the MatchedCare waitlist. Reply STOP to opt out, or email notifications@matchedcare.us to be removed.</p>`;
+}
+
+// Lightweight waitlist confirmation — provider/clinic email-only path.
+function waitlistProviderEmail({ name, state, audience }) {
+  const noun = audience === 'clinic' ? 'clinic' : 'practice';
+  return emailWrapper(`
+    <h1>You're on the founding list</h1>
+    <p class="subtitle">${escapeHtml(name || 'there')}, thanks for raising your hand. MatchedCare is live in Florida and expanding state by state — and you're first in line for ${escapeHtml(state)}.</p>
+    <div class="highlight"><p>The moment we launch in ${escapeHtml(state)}, you'll get <strong>Founding Provider</strong> status and first access to every match in your area.</p></div>
+    <p style="font-size:14px;color:#6E7178;line-height:1.7">Want to be ready on day one? You can create your full ${escapeHtml(noun)} profile anytime — it'll go live automatically the moment we open ${escapeHtml(state)}.</p>
+    <div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Create My Full Profile</a></div>
+    ${optOutLine()}`);
+}
+
+// Lightweight waitlist confirmation — patient notify-me path. No marketing tone.
+function waitlistPatientEmail({ state }) {
+  return emailWrapper(`
+    <h1>You're on the list</h1>
+    <p class="subtitle">Thanks for reaching out. MatchedCare isn't in ${escapeHtml(state)} yet, but we'll email you the moment we launch there.</p>
+    ${careResourcesHtml()}
+    ${optOutLine()}`);
+}
+
+// Full out-of-state account (provider/clinic) — profile is built, held for launch.
+function providerLaunchReadyEmail({ name, state, audience }) {
+  const noun = audience === 'clinic' ? 'clinic' : 'provider';
+  return emailWrapper(`
+    <h1>Your profile is ready for launch day</h1>
+    <p class="subtitle">${escapeHtml(name || 'there')}, your MatchedCare ${escapeHtml(noun)} profile is complete and saved. There's nothing more to do right now.</p>
+    <div class="info-box"><p class="info-label">Status</p><p class="info-value">Founding Provider — ${escapeHtml(state)}</p></div>
+    <div class="highlight"><p>You'll go live the moment MatchedCare launches in ${escapeHtml(state)}, with first access to every match. We'll email you the day it happens.</p></div>
+    <p style="font-size:14px;color:#6E7178;line-height:1.7">No payment method is needed, and there's nothing to complete in the meantime — you're all set.</p>
+    ${optOutLine()}`);
+}
+
+// Launch day — we're live in [State].
+function stateLiveEmail({ state }) {
+  return emailWrapper(`
+    <h1>We're live in ${escapeHtml(state)}</h1>
+    <p class="subtitle">The wait is over — MatchedCare is now open in ${escapeHtml(state)}. Log in to get started.</p>
+    <div class="cta-wrap"><a href="https://matchedcare.us" class="cta">Open MatchedCare</a></div>
+    ${optOutLine()}`);
+}
+
+// Confirmation email for the lightweight waitlist paths. Abuse-hardened: only
+// sends if the email was added to the waitlist for this audience within the last
+// 10 minutes (else 403), and rate-limited to 5/hour/IP. This prevents the
+// endpoint being used as an open email cannon.
+const waitlistConfirmLimiter = makeRateLimiter(60 * 60 * 1000, 5);
+app.post('/waitlist-confirm', rateLimit(waitlistConfirmLimiter), async (req, res) => {
+  try {
+    const email = safeEmail(req.body?.email);
+    const audience = String(req.body?.audience || '').trim();
+    if (!email) return res.status(400).json({ error: 'A valid email is required' });
+    if (!['provider', 'clinic', 'patient'].includes(audience)) {
+      return res.status(400).json({ error: 'Invalid audience' });
+    }
+    const tenMinAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+    const { data: row } = await supabase
+      .from('waitlist')
+      .select('email, state, full_name, created_at')
+      .eq('email', email)
+      .eq('audience', audience)
+      .gte('created_at', tenMinAgo)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!row) {
+      // No recent signup -> refuse. Do not reveal whether the email exists.
+      return res.status(403).json({ error: 'No recent waitlist signup found for this email.' });
+    }
+    const stateLabel = US_STATE_NAMES[String(row.state || '').toUpperCase()] || row.state || 'your state';
+    let subject, html;
+    if (audience === 'patient') {
+      subject = "You're on the MatchedCare list";
+      html = waitlistPatientEmail({ state: stateLabel });
+    } else {
+      subject = "You're on the MatchedCare founding list";
+      html = waitlistProviderEmail({ name: row.full_name, state: stateLabel, audience });
+    }
+    await resend.emails.send({ from: FROM_EMAIL, to: email, subject, html });
+    res.json({ success: true });
+  } catch (err) {
+    safeError(res, 'waitlist-confirm', err, 'Could not send confirmation.');
+  }
+});
+
+// Launch-day lever. Gated by a shared secret (x-launch-secret header matching
+// LAUNCH_STATE_SECRET). Flips every waitlisted provider/clinic/patient in the
+// state live, then emails the waitlist + flipped account holders.
+app.post('/launch-state', async (req, res) => {
+  try {
+    const provided = String(req.headers['x-launch-secret'] || '');
+    const expected = String(process.env.LAUNCH_STATE_SECRET || '');
+    if (!expected || provided !== expected) return res.status(403).json({ error: 'Forbidden' });
+
+    const state = String(req.body?.state || '').trim().toUpperCase();
+    if (!/^[A-Z]{2}$/.test(state)) return res.status(400).json({ error: 'state must be a 2-letter code' });
+    const stateLabel = US_STATE_NAMES[state] || state;
+
+    // 1. Providers: flip live + accepting.
+    const { data: tUp } = await supabase.from('therapists')
+      .update({ waitlisted: false, is_accepting: true })
+      .eq('state', state).eq('waitlisted', true).select('user_id');
+    // 2. Clinics: flip live + accepting (clinics uses accepts_new_clients).
+    const { data: cUp } = await supabase.from('clinics')
+      .update({ waitlisted: false, accepts_new_clients: true })
+      .eq('state', state).eq('waitlisted', true).select('owner_id');
+    // 3. Patient light accounts: flip live (do NOT forget these).
+    const { data: pUp } = await supabase.from('profiles')
+      .update({ waitlisted: false })
+      .eq('state', state).eq('waitlisted', true).select('user_id');
+
+    // Recipients: everyone on the waitlist for the state + every flipped holder.
+    const emails = new Set();
+    const { data: wl } = await supabase.from('waitlist').select('email').eq('state', state);
+    (wl || []).forEach((r) => r.email && emails.add(r.email.toLowerCase()));
+
+    const holderIds = [
+      ...((tUp || []).map((t) => t.user_id)),
+      ...((cUp || []).map((c) => c.owner_id)),
+      ...((pUp || []).map((p) => p.user_id)),
+    ].filter(Boolean);
+    if (holderIds.length) {
+      const { data: profs } = await supabase.from('profiles').select('email').in('user_id', holderIds);
+      (profs || []).forEach((p) => p.email && emails.add(p.email.toLowerCase()));
+    }
+
+    let emailsSent = 0;
+    for (const to of emails) {
+      try {
+        await resend.emails.send({ from: FROM_EMAIL, to, subject: `MatchedCare is now live in ${stateLabel}`, html: stateLiveEmail({ state: stateLabel }) });
+        emailsSent++;
+      } catch (e) {
+        console.error('launch-state email error:', e.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      state,
+      providers_flipped: (tUp || []).length,
+      clinics_flipped: (cUp || []).length,
+      patients_flipped: (pUp || []).length,
+      emails_sent: emailsSent,
+    });
+  } catch (err) {
+    safeError(res, 'launch-state', err, 'Could not launch state.');
+  }
+});
 
 app.listen(PORT, () => {
   console.log(`MatchedCare Billing Server running on port ${PORT}`);
