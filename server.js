@@ -428,6 +428,18 @@ h1{font-size:22px;font-weight:500;color:#1A242E;margin:0 0 8px;line-height:1.3}
 </style></head><body><div class="container"><div class="card"><div class="logo"><div class="logo-text">MatchedCare</div><div class="logo-sub">The right provider changes everything</div></div>${content}</div><div class="footer"><p class="footer-text">This email was sent by MatchedCare.<br><a href="https://matchedcare.us" class="footer-link">matchedcare.us</a> · <a href="https://matchedcare.us?v=privacy" class="footer-link">Privacy Policy</a></p></div></div></body></html>`;
 }
 
+// Expectation-setting blocks shared across match emails so the client and the
+// provider work from the SAME script (client knows what to send first; provider
+// knows what the client was told to expect).
+function clientNextStepsBlock(providerName) {
+  return `<div class="info-box"><p class="info-label">What happens next</p>
+    <p style="font-size:14px;color:#2C3038;line-height:1.7;margin:0 0 10px">Reach out to ${escapeHtml(providerName || 'your matched provider')} directly to get started. In your first message, it helps to include your insurance (or that you're planning to pay out of pocket), two or three times you're generally free, and a sentence about what's bringing you to therapy.</p>
+    <p style="font-size:14px;color:#2C3038;line-height:1.7;margin:0">Most providers begin with a brief phone consultation — usually 10-15 minutes — before scheduling your first session, so you can both make sure it feels like the right fit.</p></div>`;
+}
+function providerFirstContactScript() {
+  return `<div class="highlight"><p>The client has been asked to include their insurance, availability, and a brief note about what's bringing them in with their first message — and told to expect a short consultation call (10-15 min) before scheduling. You're both working from the same script.</p></div>`;
+}
+
 function clientMatchEmail({ clientName, providerName, providerCredentials, providerType, matchScore, providerEmail, explanation }) {
   const email = safeEmail(providerEmail);
   return emailWrapper(`
@@ -439,6 +451,7 @@ function clientMatchEmail({ clientName, providerName, providerCredentials, provi
     ${explanation ? `<div class="highlight"><p>${escapeHtml(explanation)}</p></div>` : ''}
     ${email ? `<div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
     <p style="font-size:14px;color:#6E7178;line-height:1.6">Your provider has been notified and is ready to connect.</p>
+    ${clientNextStepsBlock(providerName)}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Go to Dashboard</a></div>`);
 }
 
@@ -452,6 +465,7 @@ function providerMatchEmail({ providerName, clientName, clientEmail, matchScore,
     ${concerns && concerns.length > 0 ? `<div class="info-box"><p class="info-label">Primary Concerns</p><p style="font-size:14px;color:#2C3038;margin:4px 0 0">${escapeHtml(concerns.join(', '))}</p></div>` : ''}
     ${explanation ? `<div class="highlight"><p><strong>Why you were matched:</strong> ${escapeHtml(explanation)}</p></div>` : ''}
     ${email ? `<div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
+    ${providerFirstContactScript()}
     ${FREE_MODE ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">MatchedCare is free during early access — there's no charge for this or any referral right now.</p>` : (referralCount !== undefined ? `<p style="font-size:13px;color:#9A9DA4;margin-top:16px">This is referral #${escapeHtml(referralCount)}${referralCount < 5 ? ' of your 5 free referrals.' : '. Billing is now active.'}</p>` : '')}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard</a></div>`);
 }
@@ -468,6 +482,7 @@ function clinicMatchEmail({ clinicName, clientName, clientEmail, serviceType, ma
     ${explanation ? `<div class="highlight"><p>${escapeHtml(explanation)}</p></div>` : ''}
     ${email ? `<div class="info-box"><p class="info-label">Client Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
     <p style="font-size:14px;color:#6E7178;line-height:1.6">Please assign this client to an available provider and reach out to schedule.</p>
+    ${providerFirstContactScript()}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View in Dashboard</a></div>`);
 }
 
@@ -498,6 +513,7 @@ function therapistMatchAlertEmail({ providerName, clientFirstName, concern, insu
     ${insurance ? `<div class="info-box"><p class="info-label">Insurance</p><p class="info-value">${escapeHtml(insurance)}</p></div>` : ''}
     ${schedule ? `<div class="info-box"><p class="info-label">Preferred schedule</p><p class="info-value">${escapeHtml(schedule)}</p></div>` : ''}
     <p style="font-size:14px;color:#6E7178;line-height:1.6">Review this match and accept to see full client details and connect.</p>
+    ${providerFirstContactScript()}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">Review Match</a></div>`);
 }
 
@@ -521,6 +537,7 @@ function clientAcceptedEmail({ clientName, providerName, credentials, providerTy
     ${headline ? `<div class="highlight"><p>${escapeHtml(headline)}</p></div>` : ''}
     ${specialties && specialties.length ? `<div class="info-box"><p class="info-label">Specialties</p><p class="info-value">${escapeHtml(specialties.join(', '))}</p></div>` : ''}
     ${email ? `<div class="info-box"><p class="info-label">Contact</p><p class="info-value"><a href="mailto:${email}" style="color:#4A7C9B;text-decoration:none">${escapeHtml(email)}</a></p></div>` : ''}
+    ${clientNextStepsBlock(providerName)}
     <div class="cta-wrap"><a href="https://matchedcare.us?v=dashboard" class="cta">View Your Therapist's Profile</a></div>`);
 }
 
